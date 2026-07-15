@@ -43,8 +43,9 @@ SRC_NAME="bangkok"
 # Each entry is `name=ip4[,ip6]`; if v6 present, daemon rounds-robins both
 # families AND both protocols and writes independent rows:
 #   proto=tcp_synack (via XDP-caught SA)  ip_ver=4|6
-#   proto=icmp       (v4 raw echo)         ip_ver=4
-#   proto=icmpv6     (v6 raw echo)         ip_ver=6
+#   proto=icmp       (raw echo request)    ip_ver=4|6
+# ip_ver alone distinguishes ICMPv4 vs ICMPv6; the proto column stays 'icmp'
+# for both so downstream (Grafana proto dropdown) shows just tcp_synack/icmp.
 # v6 addresses are the real public v6s from vps.yaml — verified reachable
 # from this hub (ping6 + scapy SYN test confirmed SA returns via eth0).
 TARGETS=(

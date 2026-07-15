@@ -287,8 +287,11 @@ class ProbeDaemon:
         # PG, and for each family we also emit an ICMP echo probe alongside
         # the TCP SYN probe. proto is one of:
         #   'tcp_synack'  - hub sends SYN, XDP catches SA on ringbuf
-        #   'icmp'        - v4 raw ICMP echo request, reply via raw socket
-        #   'icmpv6'      - v6 raw ICMPv6 echo request, reply via raw socket
+        #   'icmp'        - raw ICMP echo request (v4 wire) or ICMPv6 echo
+        #                   request (v6 wire); the ip_ver column already
+        #                   distinguishes the two, so we keep proto='icmp'
+        #                   for both families rather than encoding the wire
+        #                   version twice.
         self.pairs = []           # list[(name, family:int, dst_ip:str, proto:str)]
         first_v4 = None
         first_v6 = None
@@ -299,7 +302,7 @@ class ProbeDaemon:
                 if first_v4 is None: first_v4 = v4
             if v6:
                 self.pairs.append((name, socket.AF_INET6, v6, "tcp_synack"))
-                self.pairs.append((name, socket.AF_INET6, v6, "icmpv6"))
+                self.pairs.append((name, socket.AF_INET6, v6, "icmp"))
                 if first_v6 is None: first_v6 = v6
         if not self.pairs:
             raise RuntimeError("no probe pairs after target expansion")
@@ -607,7 +610,10 @@ class ProbeDaemon:
             self._icmp_seq_v4 = (self._icmp_seq_v4 + 1) & 0xffff
         elif family == socket.AF_INET6:
             ip_ver = 6
-            proto  = "icmpv6"
+            # proto stays 'icmp' regardless of wire family; ip_ver=6
+            # already tells downstream (PG rows / grafana filters) that
+            # this is ICMPv6 on the wire.
+            proto  = "icmp"
             sock   = self.icmp6_sock
             icmp_type = 128          # ICMPv6 echo request
             seq = self._icmp_seq_v6
@@ -706,9 +712,16 @@ class ProbeDaemon:
     # ---- ICMP rx: independent thread, blocks on select() over v4+v6 raw ----
     def icmp_setup(self):
         """Open v4/v6 ICMP raw sockets if the target list needs them.
-        Only opens the families that actually have probes queued."""
-        need_v4 = any(p == "icmp"    for (_, _, _, p) in self.pairs)
-        need_v6 = any(p == "icmpv6"  for (_, _, _, p) in self.pairs)
+        Only opens the families that actually have probes queued.
+
+        Both v4 and v6 icmp probes carry proto='icmp' in the pending map
+        and in PG (ip_ver distinguishes them); we tell the two families
+        apart here by looking at the (family, proto) pair from the
+        expanded target list."""
+        need_v4 = any(f == socket.AF_INET  and p == "icmp"
+                      for (_, f, _, p) in self.pairs)
+        need_v6 = any(f == socket.AF_INET6 and p == "icmp"
+                      for (_, f, _, p) in self.pairs)
         if need_v4:
             s = socket.socket(socket.AF_INET, socket.SOCK_RAW,
                               socket.IPPROTO_ICMP)
@@ -761,7 +774,9 @@ class ProbeDaemon:
             if icmp_type != 129:     # 129 = ICMPv6 echo reply
                 return
             ident, seq = struct.unpack("!HH", buf[4:8])
-            proto = "icmpv6"
+            # See icmp_setup docstring: v6 icmp probes are also stored as
+            # proto='icmp'; ip_ver=6 is what disambiguates them from v4.
+            proto = "icmp"
             ip_ver = 6
 
         if ident != self.icmp_id:
