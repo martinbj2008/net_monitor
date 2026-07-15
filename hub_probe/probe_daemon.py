@@ -273,6 +273,10 @@ class ProbeDaemon:
     def __init__(self, args):
         self.args = args
         self.stop_flag = False
+        # Event that mirrors stop_flag but is wait()-friendly: threads that
+        # block waiting for the next tick call self._wake.wait(remaining),
+        # which returns immediately once shutdown flips the flag.
+        self._wake = threading.Event()
 
         # --src-name is required (enforced by argparse). We deliberately do NOT
         # fall back to socket.gethostname(): the box hostname (e.g.
@@ -685,29 +689,81 @@ class ProbeDaemon:
             print(f"[tx]  {proto:<7} v{ip_ver} {dst_name:<12} id={self.icmp_id} "
                   f"seq={seq} probe_seq={probe_seq}")
 
+    def _fire_one(self, dst_name, family, dst_ip, proto):
+        """Send a single probe packet; isolate per-pair send errors so one
+        bad target doesn't sink the whole tick."""
+        try:
+            if proto == "tcp_synack":
+                self._send_one_tcp(dst_name, family, dst_ip)
+            else:
+                self._send_one_icmp(dst_name, family, dst_ip)
+        except Exception as e:
+            print(f"[send err] {proto} {dst_name} {dst_ip}: {e}")
+
+    def _tick(self):
+        """One sampling round: fire probes for every (dst, proto, ipver) pair
+        back-to-back. Sends are non-blocking syscalls (put packet on socket
+        queue and return); the whole burst finishes in well under a
+        millisecond for our current ~12-pair list, so all points inside a
+        tick share effectively the same wall-clock timestamp -- which is
+        exactly what makes the raw dashboard's per-second alignment work."""
+        for dst_name, family, dst_ip, proto in self.pairs:
+            if self.stop_flag:
+                return
+            self._fire_one(dst_name, family, dst_ip, proto)
+
     def _sender_loop(self):
+        """Periodic-timer sender.
+
+        Model: fire *all* pairs at each tick, then wait until the next
+        absolute monotonic deadline. This gives:
+          * exact per-pair sampling period = interval_ms (no drift)
+          * all pairs in a tick share the same timestamp bucket, so the
+            raw Grafana view lines up cleanly across dst/proto series
+          * shutdown is instant: self._wake.set() aborts the wait()
+
+        Overrun policy: if a tick's send burst takes longer than the
+        interval (shouldn't happen with sub-ms sends, but future-proof),
+        we log a warning and re-anchor the next deadline to 'now + interval'
+        rather than firing back-to-back, which would just amplify whatever
+        is making sends slow.
+        """
         interval = self.args.interval_ms / 1000.0
-        end = time.monotonic() + self.args.duration_s if self.args.duration_s > 0 else None
-        i = 0
+        if interval <= 0:
+            # Degenerate case: never sleep. Guard against pegging a core.
+            interval = 0.001
+        end = (time.monotonic() + self.args.duration_s
+               if self.args.duration_s > 0 else None)
+
+        next_tick = time.monotonic()
         while not self.stop_flag:
             if end and time.monotonic() >= end:
                 print("[info] --duration-s reached, stopping sender")
                 self.stop_flag = True
+                self._wake.set()
                 break
-            dst_name, family, dst_ip, proto = self.pairs[i % len(self.pairs)]
-            try:
-                if proto == "tcp_synack":
-                    self._send_one_tcp(dst_name, family, dst_ip)
-                else:
-                    self._send_one_icmp(dst_name, family, dst_ip)
-            except Exception as e:
-                print(f"[send err] {proto} {dst_name} {dst_ip}: {e}")
-            i += 1
-            slept = 0.0
-            while slept < interval and not self.stop_flag:
-                dt_s = min(0.1, interval - slept)
-                time.sleep(dt_s)
-                slept += dt_s
+
+            tick_start = time.monotonic()
+            self._tick()
+            tick_cost = time.monotonic() - tick_start
+
+            next_tick += interval
+            now = time.monotonic()
+            remaining = next_tick - now
+            if remaining < 0:
+                # Burst took longer than the interval -- data will thin out.
+                # Re-anchor to 'now' so we don't spiral into back-to-back
+                # firing.
+                print(f"[warn] tick overrun: burst={tick_cost*1000:.1f}ms "
+                      f"interval={interval*1000:.1f}ms, skipping catch-up")
+                next_tick = now + interval
+                remaining = interval
+
+            # Interruptible wait: shutdown paths call self._wake.set() to
+            # break out immediately.
+            if self._wake.wait(remaining):
+                # Woken by shutdown; loop condition will exit.
+                break
 
     # ---- ICMP rx: independent thread, blocks on select() over v4+v6 raw ----
     def icmp_setup(self):
@@ -891,6 +947,7 @@ class ProbeDaemon:
 
         def _sig(_signum, _frame):
             self.stop_flag = True
+            self._wake.set()
         signal.signal(signal.SIGINT,  _sig)
         signal.signal(signal.SIGTERM, _sig)
 
@@ -939,6 +996,7 @@ class ProbeDaemon:
                     last_stat = now
         finally:
             self.stop_flag = True
+            self._wake.set()
             t.join(timeout=2.0)
             if rx_t is not None:
                 rx_t.join(timeout=2.0)
@@ -995,7 +1053,10 @@ def main():
                          "refuse to fall back to socket.gethostname() because "
                          "the OS hostname is not a business identity.")
     ap.add_argument("--interval-ms", type=int, default=1000,
-                    help="delay between successive SYNs across all targets")
+                    help="tick period: every INTERVAL_MS the daemon fires "
+                         "probes for ALL (dst, proto, ipver) pairs in one "
+                         "burst, so each pair gets exactly one sample per "
+                         "interval")
     ap.add_argument("--timeout-ms", type=int, default=3000,
                     help="mark probe as loss if no SA within this window")
     ap.add_argument("--duration-s", type=int, default=0,

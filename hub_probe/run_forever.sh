@@ -30,7 +30,12 @@ set -euo pipefail
 
 # ---------- config: EDIT HERE if peer list / creds change ----------
 IFACE="eth0"
-INTERVAL_MS=100
+# INTERVAL_MS is the tick period: every INTERVAL_MS the daemon fires probes
+# for ALL (dst, proto, ipver) pairs back-to-back in one burst. So each pair
+# gets exactly one sample per interval, and all pairs in a tick share the
+# same wall-clock timestamp -- which is what makes the raw dashboard's
+# per-second alignment work.
+INTERVAL_MS=1000
 TIMEOUT_MS=3000
 BATCH_SIZE=1000
 BATCH_INTERVAL_S=60
