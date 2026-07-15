@@ -38,6 +38,7 @@ FILES=(
   "hub_probe/step3_probe.py"
   "hub_probe/step3_run.sh"
   "hub_probe/verify_kernel_rst.sh"
+  "hub_probe/verify_rst_dropper.sh"
 )
 
 PUSH=1
