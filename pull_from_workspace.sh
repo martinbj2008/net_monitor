@@ -29,6 +29,11 @@ FILES=(
   "hub_sysctl_reserve_ports.sh"
   "xdp_env_check.sh"
   "tcp_probe_diag.sh"
+  # --- XDP Step 2 scaffold ---
+  "bpf/probe_xdp.h"
+  "bpf/probe_xdp.bpf.c"
+  "bpf/Makefile"
+  "hub_probe/test_loader.py"
 )
 
 PUSH=1
