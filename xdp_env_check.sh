@@ -119,8 +119,11 @@ SEC("xdp") int smoke(struct xdp_md *ctx) { return XDP_PASS; }
 char _license[] SEC("license") = "GPL";
 BPFEOF
 
+ARCH_INC=$(ls -d /usr/include/*-linux-gnu 2>/dev/null | head -1)
 if command -v clang >/dev/null 2>&1; then
-  if clang -O2 -g -target bpf -c "$TMPDIR/smoke.bpf.c" -o "$TMPDIR/smoke.o" 2>"$TMPDIR/clang.err"; then
+  if clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+      ${ARCH_INC:+-I"$ARCH_INC"} \
+      -c "$TMPDIR/smoke.bpf.c" -o "$TMPDIR/smoke.o" 2>"$TMPDIR/clang.err"; then
     say PASS "B.3 compile smoke.bpf.c ok"
     ATTACHED=""
     if ip link set dev "$IFACE" xdp obj "$TMPDIR/smoke.o" sec xdp 2>"$TMPDIR/attach.err"; then
