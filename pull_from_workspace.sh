@@ -34,6 +34,8 @@ FILES=(
   "bpf/probe_xdp.bpf.c"
   "bpf/Makefile"
   "hub_probe/test_loader.py"
+  # --- XDP Step 3 verification probe ---
+  "hub_probe/step3_probe.py"
 )
 
 PUSH=1
