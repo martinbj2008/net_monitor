@@ -44,6 +44,8 @@ FILES=(
   "hub_probe/step4_run.sh"
   # --- experiments ---
   "hub_probe/exp_same_sport.py"
+  # --- ops / one-off cleanup scripts (run on hub + all leaves) ---
+  "ops/cleanup_legacy_vps_probe.sh"
 )
 
 PUSH=1
