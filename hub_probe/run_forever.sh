@@ -41,7 +41,10 @@ SRC_NAME="bangkok"
 
 # Fixed peer list. Names are free-form labels stored in probe_sample.dst_name.
 # Each entry is `name=ip4[,ip6]`; if v6 present, daemon rounds-robins both
-# families and writes independent rows (proto=tcp_synack, ip_ver=4 or 6).
+# families AND both protocols and writes independent rows:
+#   proto=tcp_synack (via XDP-caught SA)  ip_ver=4|6
+#   proto=icmp       (v4 raw echo)         ip_ver=4
+#   proto=icmpv6     (v6 raw echo)         ip_ver=6
 # v6 addresses are the real public v6s from vps.yaml — verified reachable
 # from this hub (ping6 + scapy SYN test confirmed SA returns via eth0).
 TARGETS=(

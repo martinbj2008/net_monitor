@@ -60,6 +60,14 @@ for a in "$@"; do
   esac
 done
 
+# Track whether any file under docker/ changed. If yes, the hub-side
+# probe_grafana container may need `docker restart probe_grafana` to pick up
+# new dashboards/provisioning, because Docker bind-mounts can become "deleted"
+# state when their source directory inode is replaced (which git occasionally
+# does on tree reorgs). File-content changes alone don't trigger this, but we
+# print the reminder unconditionally when docker/ is touched — cheap insurance.
+docker_touched=0
+
 cd "$SCRIPT_DIR"
 
 echo "[info] src workspace: $SRC_DIR"
@@ -114,6 +122,9 @@ for d in "${DIRS[@]}"; do
       echo "  SYNC  ${d}/"
       echo "$rsync_out" | sed 's/^/        /'
       changed=$(( changed + 1 ))
+      if [[ "$d" == "docker" ]]; then
+        docker_touched=1
+      fi
     else
       echo "  same  ${d}/"
     fi
@@ -141,6 +152,21 @@ if [[ $PUSH -eq 1 ]]; then
   git push
 else
   echo "[info] --no-push: skipping git push."
+fi
+
+if [[ $docker_touched -eq 1 ]]; then
+  echo
+  echo "============================================================"
+  echo "[REMINDER] docker/ was updated. On the hub, after \`git pull\`:"
+  echo "    docker restart probe_grafana"
+  echo "    docker restart probe_pg   # only if postgres/initdb/ changed"
+  echo
+  echo "This is needed because Grafana bind-mounts "
+  echo "  /root/git/net_monitor/docker/grafana/{dashboards,provisioning}"
+  echo "can enter 'deleted' state when git reorganizes those subtrees,"
+  echo "leaving the container blind to updated files. A restart rebinds"
+  echo "to the current inode. Cheap; do it."
+  echo "============================================================"
 fi
 
 echo "[done]"

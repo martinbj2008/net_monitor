@@ -52,6 +52,7 @@ import datetime as dt
 import ipaddress
 import os
 import secrets
+import select
 import signal
 import socket
 import struct
@@ -280,18 +281,25 @@ class ProbeDaemon:
         # Deployment MUST decide the name (see run_forever.sh SRC_NAME).
         self.src_name = args.src_name
 
-        # Expand targets into a flat list of (name, family, dst_ip) pairs.
-        # Sender loop round-robins through this list, so a target that has
-        # both v4 and v6 gets both probed on independent rows in PG.
-        self.pairs = []           # list[(name, family:int, dst_ip:str)]
+        # Expand targets into a flat list of (name, family, dst_ip, proto)
+        # pairs. Sender loop round-robins through this list, so a target
+        # that has both v4 and v6 gets both probed on independent rows in
+        # PG, and for each family we also emit an ICMP echo probe alongside
+        # the TCP SYN probe. proto is one of:
+        #   'tcp_synack'  - hub sends SYN, XDP catches SA on ringbuf
+        #   'icmp'        - v4 raw ICMP echo request, reply via raw socket
+        #   'icmpv6'      - v6 raw ICMPv6 echo request, reply via raw socket
+        self.pairs = []           # list[(name, family:int, dst_ip:str, proto:str)]
         first_v4 = None
         first_v6 = None
         for (name, v4, v6) in args.target:
             if v4:
-                self.pairs.append((name, socket.AF_INET, v4))
+                self.pairs.append((name, socket.AF_INET,  v4, "tcp_synack"))
+                self.pairs.append((name, socket.AF_INET,  v4, "icmp"))
                 if first_v4 is None: first_v4 = v4
             if v6:
-                self.pairs.append((name, socket.AF_INET6, v6))
+                self.pairs.append((name, socket.AF_INET6, v6, "tcp_synack"))
+                self.pairs.append((name, socket.AF_INET6, v6, "icmpv6"))
                 if first_v6 is None: first_v6 = v6
         if not self.pairs:
             raise RuntimeError("no probe pairs after target expansion")
@@ -328,6 +336,19 @@ class ProbeDaemon:
         self.n_timeout = 0
         self.n_sa_retrans = 0   # SA arrived, tuple known + already matched
         self.n_sa_orphan  = 0   # SA arrived, tuple not in pending map at all
+        self.n_icmp_orphan = 0  # ICMP echo reply without matching in-flight
+
+        # ICMP echo identifier: 16-bit, tied to process PID (traditional
+        # ping(8) convention). Fixed for the process lifetime; probes are
+        # distinguished by the 16-bit sequence number.
+        self.icmp_id = os.getpid() & 0xffff
+        self._icmp_seq_v4 = 0   # walks 0..65535, wraps naturally
+        self._icmp_seq_v6 = 0
+
+        # raw sockets for ICMP send+recv. Populated in icmp_setup().
+        self.icmp4_sock = None
+        self.icmp6_sock = None
+        self._icmp_rx_thread = None
 
         # sink
         if args.sink == "pg":
@@ -410,16 +431,17 @@ class ProbeDaemon:
          sa_bytes, da_bytes) = struct.unpack(EVENT_FMT, raw)
 
         # Decode source address per ip_ver. v4 uses first 4 bytes of the 16B
-        # slot; v6 uses all 16. saddr on the wire is the leaf's IP.
+        # slot; v6 uses all 16. saddr on the wire is the leaf's IP. XDP only
+        # ever hands us TCP replies (it filters by dport=PROBE_PORT), so proto
+        # is always tcp_synack here.
         if ip_ver == 4:
             sa_src_ip = socket.inet_ntop(socket.AF_INET, sa_bytes[:4])
-            proto = "tcp_synack"
         elif ip_ver == 6:
             sa_src_ip = socket.inet_ntop(socket.AF_INET6, sa_bytes)
-            proto = "tcp_synack"
         else:
             # unknown ip_ver — ignore
             return 0
+        proto = "tcp_synack"
 
         # SA fields on the wire are (leaf_ip, leaf_sport=22, hub_ip, hub_dport,
         # seq=leaf_isn, ack_seq=hub_isn+1). We keyed pending by the SYN we
@@ -454,6 +476,7 @@ class ProbeDaemon:
             ts_iso  = iso_utc(row["send_wall"]),
             dst     = row["dst"],
             dst_ip  = row["dst_addr"],
+            proto   = "tcp_synack",
             ip_ver  = int(ip_ver),
             probe_seq = row["probe_seq"],
             rtt_ms  = int(round(rtt_ms)),
@@ -461,15 +484,15 @@ class ProbeDaemon:
         )
 
         if self.args.verbose:
-            print(f"[rtt] v{int(ip_ver)} {row['dst']:<12} sport={row['sport']} "
+            print(f"[rtt] tcp v{int(ip_ver)} {row['dst']:<12} sport={row['sport']} "
                   f"seq={row['probe_seq']} rtt={rtt_ms:.2f}ms")
         return 0
 
     # ---- buffer / flush ----
-    def _enqueue_row(self, *, ts_iso, dst, dst_ip, ip_ver, probe_seq,
+    def _enqueue_row(self, *, ts_iso, dst, dst_ip, proto, ip_ver, probe_seq,
                      rtt_ms, ok):
         row = (ts_iso, self.src_name, dst, dst_ip,
-               "tcp_synack", int(ip_ver), probe_seq, rtt_ms, ok,
+               proto, int(ip_ver), probe_seq, rtt_ms, ok,
                self.batch_ts_iso)
         need_flush = False
         with self.buffer_lock:
@@ -496,8 +519,8 @@ class ProbeDaemon:
         print(f"[flush] reason={reason} rows={len(rows)} took={dt_ms:.1f}ms "
               f"sink_total={self.sink.total}")
 
-    # ---- sender ----
-    def _send_one(self, dst_name: str, family: int, dst_ip: str):
+    # ---- sender: TCP SYN branch ----
+    def _send_one_tcp(self, dst_name: str, family: int, dst_ip: str):
         probe_seq = self.n_sent
         self.n_sent += 1
 
@@ -533,6 +556,7 @@ class ProbeDaemon:
             # if same key still present (e.g. sport reused before old TTL),
             # overwrite — the old one already had its outcome recorded.
             self.pending[key] = {
+                "proto":        "tcp_synack",
                 "send_mono_ns": send_mono,
                 "send_wall":    send_wall,
                 "sport":        sport,
@@ -547,8 +571,113 @@ class ProbeDaemon:
 
         scapy_send(pkt, iface=self.args.iface, verbose=0)
         if self.args.verbose:
-            print(f"[tx]  v{ip_ver} {dst_name:<12} sport={sport} "
+            print(f"[tx]  tcp v{ip_ver} {dst_name:<12} sport={sport} "
                   f"seq={probe_seq} tcp_seq={tcp_seq:#010x}")
+
+    # ---- sender: ICMP echo branch ----
+    @staticmethod
+    def _icmp_checksum(data: bytes) -> int:
+        """Standard Internet 16-bit one's-complement sum (RFC 1071).
+        Used for ICMPv4. For ICMPv6 the kernel fills in the checksum
+        automatically on raw sockets, so we send 0 there."""
+        if len(data) & 1:
+            data += b"\x00"
+        s = 0
+        for i in range(0, len(data), 2):
+            s += (data[i] << 8) | data[i+1]
+        s = (s >> 16) + (s & 0xffff)
+        s += (s >> 16)
+        return (~s) & 0xffff
+
+    def _send_one_icmp(self, dst_name: str, family: int, dst_ip: str):
+        """Send one ICMP (v4) or ICMPv6 echo request via raw socket.
+
+        Reply is caught by the icmp rx thread (_icmp_rx_loop) which decodes
+        the echo identifier + sequence to match against self.pending.
+        """
+        probe_seq = self.n_sent
+        self.n_sent += 1
+
+        if family == socket.AF_INET:
+            ip_ver = 4
+            proto  = "icmp"
+            sock   = self.icmp4_sock
+            icmp_type = 8            # ICMP echo request
+            seq = self._icmp_seq_v4
+            self._icmp_seq_v4 = (self._icmp_seq_v4 + 1) & 0xffff
+        elif family == socket.AF_INET6:
+            ip_ver = 6
+            proto  = "icmpv6"
+            sock   = self.icmp6_sock
+            icmp_type = 128          # ICMPv6 echo request
+            seq = self._icmp_seq_v6
+            self._icmp_seq_v6 = (self._icmp_seq_v6 + 1) & 0xffff
+        else:
+            raise RuntimeError(f"unsupported family: {family}")
+
+        # 8B ICMP header + 8B payload (send_mono_ns as timestamp is not
+        # strictly needed since we look it up in self.pending, but a bit of
+        # payload makes the packet look like a normal ping to any middle
+        # box). Keep it small; MTU is not a concern at 16 bytes.
+        payload = b"vpsprobe"
+        header = struct.pack("!BBHHH", icmp_type, 0, 0, self.icmp_id, seq)
+        if family == socket.AF_INET:
+            csum = self._icmp_checksum(header + payload)
+            header = struct.pack("!BBHHH", icmp_type, 0, csum,
+                                 self.icmp_id, seq)
+        # else: kernel fills icmpv6 checksum (IPV6_CHECKSUM=2 default on
+        # SOCK_RAW+IPPROTO_ICMPV6).
+        pkt = header + payload
+
+        send_wall = time.time()
+        send_mono = time.monotonic_ns()
+
+        # Key: (proto, ip_ver, dst_ip, icmp_id, seq). ICMP has no ports;
+        # (id, seq) uniquely identifies an in-flight echo.
+        key = (proto, ip_ver, dst_ip, self.icmp_id, seq)
+        with self.pending_lock:
+            self.pending[key] = {
+                "proto":        proto,
+                "send_mono_ns": send_mono,
+                "send_wall":    send_wall,
+                "sport":        self.icmp_id,   # for log symmetry with tcp
+                "dst":          dst_name,
+                "dst_addr":     dst_ip,
+                "ip_ver":       ip_ver,
+                "probe_seq":    probe_seq,
+                "deadline_ns":  send_mono + self.args.timeout_ms * 1_000_000,
+                "matched":      False,
+                "match_mono":   0,
+            }
+
+        try:
+            if family == socket.AF_INET:
+                sock.sendto(pkt, (dst_ip, 0))
+            else:
+                sock.sendto(pkt, (dst_ip, 0, 0, 0))
+        except OSError as e:
+            # e.g. EPERM / ENETUNREACH — mark this probe as failed immediately
+            # so it doesn't linger until timeout, and don't leak the pending
+            # entry.
+            with self.pending_lock:
+                self.pending.pop(key, None)
+            self._enqueue_row(
+                ts_iso    = iso_utc(send_wall),
+                dst       = dst_name,
+                dst_ip    = dst_ip,
+                proto     = proto,
+                ip_ver    = ip_ver,
+                probe_seq = probe_seq,
+                rtt_ms    = None,
+                ok        = False,
+            )
+            if self.args.verbose:
+                print(f"[tx err] {proto} v{ip_ver} {dst_name} {dst_ip}: {e}")
+            return
+
+        if self.args.verbose:
+            print(f"[tx]  {proto:<7} v{ip_ver} {dst_name:<12} id={self.icmp_id} "
+                  f"seq={seq} probe_seq={probe_seq}")
 
     def _sender_loop(self):
         interval = self.args.interval_ms / 1000.0
@@ -559,17 +688,143 @@ class ProbeDaemon:
                 print("[info] --duration-s reached, stopping sender")
                 self.stop_flag = True
                 break
-            dst_name, family, dst_ip = self.pairs[i % len(self.pairs)]
+            dst_name, family, dst_ip, proto = self.pairs[i % len(self.pairs)]
             try:
-                self._send_one(dst_name, family, dst_ip)
+                if proto == "tcp_synack":
+                    self._send_one_tcp(dst_name, family, dst_ip)
+                else:
+                    self._send_one_icmp(dst_name, family, dst_ip)
             except Exception as e:
-                print(f"[send err] {dst_name} {dst_ip}: {e}")
+                print(f"[send err] {proto} {dst_name} {dst_ip}: {e}")
             i += 1
             slept = 0.0
             while slept < interval and not self.stop_flag:
                 dt_s = min(0.1, interval - slept)
                 time.sleep(dt_s)
                 slept += dt_s
+
+    # ---- ICMP rx: independent thread, blocks on select() over v4+v6 raw ----
+    def icmp_setup(self):
+        """Open v4/v6 ICMP raw sockets if the target list needs them.
+        Only opens the families that actually have probes queued."""
+        need_v4 = any(p == "icmp"    for (_, _, _, p) in self.pairs)
+        need_v6 = any(p == "icmpv6"  for (_, _, _, p) in self.pairs)
+        if need_v4:
+            s = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                              socket.IPPROTO_ICMP)
+            s.setblocking(False)
+            self.icmp4_sock = s
+        if need_v6:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_RAW,
+                              socket.IPPROTO_ICMPV6)
+            s.setblocking(False)
+            self.icmp6_sock = s
+        print(f"[icmp] raw sockets: v4={'yes' if self.icmp4_sock else 'no'} "
+              f"v6={'yes' if self.icmp6_sock else 'no'} id={self.icmp_id}")
+
+    def icmp_teardown(self):
+        for s in (self.icmp4_sock, self.icmp6_sock):
+            try:
+                if s: s.close()
+            except Exception:
+                pass
+        self.icmp4_sock = None
+        self.icmp6_sock = None
+
+    def _handle_icmp_reply(self, family: int, buf: bytes, src_ip: str):
+        """Parse one ICMP/ICMPv6 datagram and, if it's an echo reply that
+        matches an in-flight probe, record RTT.
+
+        On AF_INET raw sockets, the kernel hands us the full IP header + ICMP
+        payload. On AF_INET6 raw sockets, the kernel strips the IPv6 header
+        and we get the ICMPv6 packet directly. That asymmetry is a Linux
+        quirk we accommodate here.
+        """
+        recv_mono = time.monotonic_ns()
+        if family == socket.AF_INET:
+            if len(buf) < 20:
+                return
+            ihl = (buf[0] & 0x0f) * 4
+            if len(buf) < ihl + 8:
+                return
+            icmp = buf[ihl:]
+            icmp_type = icmp[0]
+            if icmp_type != 0:       # 0 = echo reply
+                return
+            ident, seq = struct.unpack("!HH", icmp[4:8])
+            proto = "icmp"
+            ip_ver = 4
+        else:
+            if len(buf) < 8:
+                return
+            icmp_type = buf[0]
+            if icmp_type != 129:     # 129 = ICMPv6 echo reply
+                return
+            ident, seq = struct.unpack("!HH", buf[4:8])
+            proto = "icmpv6"
+            ip_ver = 6
+
+        if ident != self.icmp_id:
+            # Reply for a different process/instance; ignore.
+            return
+
+        key = (proto, ip_ver, src_ip, self.icmp_id, seq)
+        with self.pending_lock:
+            row = self.pending.get(key)
+            if row is None:
+                self.n_icmp_orphan += 1
+                return
+            if row.get("matched"):
+                # Duplicate reply for the same (id, seq) — rare but possible
+                # if a middle box duplicates the packet. Count as retrans-ish
+                # under sa_retrans bucket to keep stat surface small.
+                self.n_sa_retrans += 1
+                return
+            row["matched"]    = True
+            row["match_mono"] = recv_mono
+
+        rtt_ns = recv_mono - row["send_mono_ns"]
+        rtt_ms = rtt_ns / 1e6
+        self.n_matched += 1
+        self._enqueue_row(
+            ts_iso    = iso_utc(row["send_wall"]),
+            dst       = row["dst"],
+            dst_ip    = row["dst_addr"],
+            proto     = proto,
+            ip_ver    = ip_ver,
+            probe_seq = row["probe_seq"],
+            rtt_ms    = int(round(rtt_ms)),
+            ok        = True,
+        )
+        if self.args.verbose:
+            print(f"[rtt] {proto:<7} v{ip_ver} {row['dst']:<12} "
+                  f"id={self.icmp_id} seq={seq} rtt={rtt_ms:.2f}ms")
+
+    def _icmp_rx_loop(self):
+        socks = []
+        if self.icmp4_sock is not None: socks.append(self.icmp4_sock)
+        if self.icmp6_sock is not None: socks.append(self.icmp6_sock)
+        if not socks:
+            return
+        while not self.stop_flag:
+            try:
+                r, _, _ = select.select(socks, [], [], 0.3)
+            except (OSError, ValueError):
+                # socket closed during shutdown
+                break
+            for s in r:
+                try:
+                    data, addr = s.recvfrom(2048)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    continue
+                family = s.family
+                src_ip = addr[0] if addr else ""
+                try:
+                    self._handle_icmp_reply(family, data, src_ip)
+                except Exception as e:
+                    print(f"[icmp rx err] {e}", file=sys.stderr)
 
     def _sweep_pending(self):
         """(a) mark unmatched entries past deadline as timeout, enqueue loss row
@@ -593,22 +848,31 @@ class ProbeDaemon:
                 ts_iso    = iso_utc(v["send_wall"]),
                 dst       = v["dst"],
                 dst_ip    = v["dst_addr"],
+                proto     = v["proto"],
                 ip_ver    = v["ip_ver"],
                 probe_seq = v["probe_seq"],
                 rtt_ms    = None,
                 ok        = False,
             )
             if self.args.verbose:
-                print(f"[to]  v{v['ip_ver']} {v['dst']:<12} "
+                print(f"[to]  {v['proto']:<7} v{v['ip_ver']} {v['dst']:<12} "
                       f"sport={v['sport']} seq={v['probe_seq']} TIMEOUT")
 
     # ---- main poll loop ----
     def run(self):
         self.bpf_setup()
+        self.icmp_setup()
 
         t = threading.Thread(target=self._sender_loop, name="sender",
                              daemon=True)
         t.start()
+
+        rx_t = None
+        if self.icmp4_sock is not None or self.icmp6_sock is not None:
+            rx_t = threading.Thread(target=self._icmp_rx_loop,
+                                    name="icmp_rx", daemon=True)
+            rx_t.start()
+            self._icmp_rx_thread = rx_t
 
         def _sig(_signum, _frame):
             self.stop_flag = True
@@ -616,8 +880,8 @@ class ProbeDaemon:
         signal.signal(signal.SIGTERM, _sig)
 
         pair_summary = ",".join(
-            f"{n}/v{4 if f == socket.AF_INET else 6}"
-            for (n, f, _ip) in self.pairs
+            f"{n}/v{4 if f == socket.AF_INET else 6}/{p}"
+            for (n, f, _ip, p) in self.pairs
         )
         print(f"[info] daemon started. src={self.src_name} "
               f"v4={self.src_ip_v4} v6={self.src_ip_v6} "
@@ -654,12 +918,15 @@ class ProbeDaemon:
                           f"timeout={self.n_timeout} "
                           f"sa_retrans={self.n_sa_retrans} "
                           f"sa_orphan={self.n_sa_orphan} "
+                          f"icmp_orphan={self.n_icmp_orphan} "
                           f"pending={pend_n} buffer={buf_n} "
                           f"flushed={self.sink.total}")
                     last_stat = now
         finally:
             self.stop_flag = True
             t.join(timeout=2.0)
+            if rx_t is not None:
+                rx_t.join(timeout=2.0)
             # final sweep — count remaining unmatched as timeout
             with self.pending_lock:
                 remaining = [v for v in self.pending.values()
@@ -671,6 +938,7 @@ class ProbeDaemon:
                     ts_iso    = iso_utc(v["send_wall"]),
                     dst       = v["dst"],
                     dst_ip    = v["dst_addr"],
+                    proto     = v["proto"],
                     ip_ver    = v["ip_ver"],
                     probe_seq = v["probe_seq"],
                     rtt_ms    = None,
@@ -678,11 +946,13 @@ class ProbeDaemon:
                 )
             self._flush("shutdown")
             self.sink.close()
+            self.icmp_teardown()
             self.bpf_teardown()
             print(f"[done] sent={self.n_sent} matched={self.n_matched} "
                   f"timeout={self.n_timeout} "
                   f"sa_retrans={self.n_sa_retrans} "
                   f"sa_orphan={self.n_sa_orphan} "
+                  f"icmp_orphan={self.n_icmp_orphan} "
                   f"flushed_total={self.sink.total}")
 
 
