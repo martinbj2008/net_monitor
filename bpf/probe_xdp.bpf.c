@@ -24,7 +24,7 @@
 #include "probe_xdp.h"
 
 /* vmlinux.h contains only struct/typedef, not uapi #defines. Provide the
- * few constants we need explicitly so we don't drag in <linux/*.h>. */
+ * few constants we need explicitly so we don't drag in <linux/xxx.h>. */
 #ifndef ETH_P_IP
 #define ETH_P_IP        0x0800
 #endif

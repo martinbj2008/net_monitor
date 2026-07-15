@@ -40,7 +40,7 @@
 # --- Usage on hub ---
 #   sudo python3 probe_daemon.py \
 #     --iface eth0 \
-#     --target hongkong=43.132.210.4 \
+#     --target hongkong=43.132.210.4,2402:xxxx::1 \
 #     --src-name bangkok \
 #     --interval-ms 1000 --duration-s 60 \
 #     --sink pg \
@@ -64,7 +64,7 @@ from pathlib import Path
 os.environ.setdefault("SCAPY_USE_PCAPDNET", "0")
 import logging
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-from scapy.all import IP, TCP, send as scapy_send  # noqa: E402
+from scapy.all import IP, IPv6, TCP, send as scapy_send  # noqa: E402
 
 # ---------- constants shared with BPF ----------
 # v2 (2026-07): unified v4/v6 layout, 56 bytes. Must match struct probe_event
@@ -154,22 +154,51 @@ XDP_FLAGS_DRV_MODE = 1 << 2
 
 # ---------- helpers ----------
 def parse_target(spec: str):
-    """`name=ip` -> (name, ip). Both required."""
+    """`name=ip[,ip]` -> (name, ipv4_or_None, ipv6_or_None).
+
+    Accepted forms:
+        hongkong=1.2.3.4
+        hongkong=2402:xxxx::1
+        hongkong=1.2.3.4,2402:xxxx::1
+        hongkong=2402:xxxx::1,1.2.3.4       (order-agnostic)
+    At least one address must be present. IPv6 addresses containing '::' or
+    hex groups are auto-detected via ipaddress.ip_address.
+    """
     if "=" not in spec:
         raise argparse.ArgumentTypeError(
-            f"target must be name=ipv4, got: {spec}")
-    name, ip = spec.split("=", 1)
-    name = name.strip(); ip = ip.strip()
-    if not name or not ip:
-        raise argparse.ArgumentTypeError(f"empty name or ip in: {spec}")
-    try:
-        ipaddress.IPv4Address(ip)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"bad ipv4: {ip}")
-    return (name, ip)
+            f"target must be name=ip[,ip], got: {spec}")
+    name, addrs = spec.split("=", 1)
+    name = name.strip()
+    if not name:
+        raise argparse.ArgumentTypeError(f"empty name in: {spec}")
+    v4 = None
+    v6 = None
+    for part in addrs.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            ip = ipaddress.ip_address(p)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"bad ip in {spec}: {p}")
+        if isinstance(ip, ipaddress.IPv4Address):
+            if v4 is not None:
+                raise argparse.ArgumentTypeError(
+                    f"two IPv4 addrs in {spec}")
+            v4 = str(ip)
+        else:
+            if v6 is not None:
+                raise argparse.ArgumentTypeError(
+                    f"two IPv6 addrs in {spec}")
+            v6 = str(ip)
+    if v4 is None and v6 is None:
+        raise argparse.ArgumentTypeError(f"no addr in: {spec}")
+    return (name, v4, v6)
 
-def local_ip_for(target_ip: str) -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def local_ip_for(target_ip: str, family: int) -> str:
+    """Discover the local egress IP for reaching target_ip.
+    family = socket.AF_INET or socket.AF_INET6."""
+    s = socket.socket(family, socket.SOCK_DGRAM)
     try:
         s.connect((target_ip, 1))
         return s.getsockname()[0]
@@ -250,9 +279,29 @@ class ProbeDaemon:
         # ends up in probe_sample.src, polluting downstream dashboards.
         # Deployment MUST decide the name (see run_forever.sh SRC_NAME).
         self.src_name = args.src_name
-        # pick src IP once from the first target — hub only has one uplink
-        first_ip = args.target[0][1]
-        self.src_ip = local_ip_for(first_ip)
+
+        # Expand targets into a flat list of (name, family, dst_ip) pairs.
+        # Sender loop round-robins through this list, so a target that has
+        # both v4 and v6 gets both probed on independent rows in PG.
+        self.pairs = []           # list[(name, family:int, dst_ip:str)]
+        first_v4 = None
+        first_v6 = None
+        for (name, v4, v6) in args.target:
+            if v4:
+                self.pairs.append((name, socket.AF_INET, v4))
+                if first_v4 is None: first_v4 = v4
+            if v6:
+                self.pairs.append((name, socket.AF_INET6, v6))
+                if first_v6 is None: first_v6 = v6
+        if not self.pairs:
+            raise RuntimeError("no probe pairs after target expansion")
+
+        # Discover local egress addresses. We look each family up ONCE at
+        # startup — the hub has a single uplink of each kind (eth0 + wg).
+        self.src_ip_v4 = local_ip_for(first_v4, socket.AF_INET) \
+                         if first_v4 else None
+        self.src_ip_v6 = local_ip_for(first_v6, socket.AF_INET6) \
+                         if first_v6 else None
 
         self.batch_ts_wall = time.time()
         self.batch_ts_iso  = iso_utc(self.batch_ts_wall)
@@ -375,11 +424,13 @@ class ProbeDaemon:
         # SA fields on the wire are (leaf_ip, leaf_sport=22, hub_ip, hub_dport,
         # seq=leaf_isn, ack_seq=hub_isn+1). We keyed pending by the SYN we
         # sent: (proto, ip_ver, dst_ip=leaf_ip, dport=leaf_port=22,
-        #        sport=hub_port, ack_expected=hub_isn+1).
+        #        sport=hub_port, ack_expected=hub_isn+1). Note ip_ver comes
+        # straight from the BPF event, so v4 and v6 keys are disjoint.
         sa_src_port = socket.ntohs(sp_be)
         sa_dst_port = socket.ntohs(dp_be)
         ack_host    = socket.ntohl(ack_be) & 0xffffffff
-        key = (proto, ip_ver, sa_src_ip, sa_src_port, sa_dst_port, ack_host)
+        key = (proto, int(ip_ver), sa_src_ip, sa_src_port, sa_dst_port,
+               ack_host)
 
         recv_mono = time.monotonic_ns()
 
@@ -403,20 +454,22 @@ class ProbeDaemon:
             ts_iso  = iso_utc(row["send_wall"]),
             dst     = row["dst"],
             dst_ip  = row["dst_addr"],
+            ip_ver  = int(ip_ver),
             probe_seq = row["probe_seq"],
             rtt_ms  = int(round(rtt_ms)),
             ok      = True,
         )
 
         if self.args.verbose:
-            print(f"[rtt] {row['dst']:<12} sport={row['sport']} "
+            print(f"[rtt] v{int(ip_ver)} {row['dst']:<12} sport={row['sport']} "
                   f"seq={row['probe_seq']} rtt={rtt_ms:.2f}ms")
         return 0
 
     # ---- buffer / flush ----
-    def _enqueue_row(self, *, ts_iso, dst, dst_ip, probe_seq, rtt_ms, ok):
+    def _enqueue_row(self, *, ts_iso, dst, dst_ip, ip_ver, probe_seq,
+                     rtt_ms, ok):
         row = (ts_iso, self.src_name, dst, dst_ip,
-               "tcp_synack", 4, probe_seq, rtt_ms, ok,
+               "tcp_synack", int(ip_ver), probe_seq, rtt_ms, ok,
                self.batch_ts_iso)
         need_flush = False
         with self.buffer_lock:
@@ -444,7 +497,7 @@ class ProbeDaemon:
               f"sink_total={self.sink.total}")
 
     # ---- sender ----
-    def _send_one(self, dst_name: str, dst_ip: str):
+    def _send_one(self, dst_name: str, family: int, dst_ip: str):
         probe_seq = self.n_sent
         self.n_sent += 1
 
@@ -454,19 +507,28 @@ class ProbeDaemon:
         self._seq_cursor = (self._seq_cursor + SEQ_STEP) & 0xffffffff
         ack_expected = (tcp_seq + 1) & 0xffffffff
 
-        pkt = IP(src=self.src_ip, dst=dst_ip) / \
-              TCP(sport=sport, dport=self.args.dport, flags="S",
-                  seq=tcp_seq, window=64240,
-                  options=[("MSS", 1460)])
+        if family == socket.AF_INET:
+            ip_ver = 4
+            src_ip = self.src_ip_v4
+            l3 = IP(src=src_ip, dst=dst_ip)
+        elif family == socket.AF_INET6:
+            ip_ver = 6
+            src_ip = self.src_ip_v6
+            l3 = IPv6(src=src_ip, dst=dst_ip)
+        else:
+            raise RuntimeError(f"unsupported family: {family}")
+
+        pkt = l3 / TCP(sport=sport, dport=self.args.dport, flags="S",
+                       seq=tcp_seq, window=64240,
+                       options=[("MSS", 1460)])
 
         send_wall = time.time()
         send_mono = time.monotonic_ns()
 
-        # Key MUST match what _on_event builds when a reply arrives. The
-        # (proto, ip_ver) prefix is currently constant (tcp_synack/4) but is
-        # kept in the key so future v6 / icmp workers can coexist without
-        # tuple collisions.
-        key = ("tcp_synack", 4, dst_ip, self.args.dport, sport, ack_expected)
+        # Key MUST match what _on_event builds when a reply arrives.
+        # (proto, ip_ver) prefix keeps v4/v6/icmp key spaces disjoint.
+        key = ("tcp_synack", ip_ver, dst_ip, self.args.dport, sport,
+               ack_expected)
         with self.pending_lock:
             # if same key still present (e.g. sport reused before old TTL),
             # overwrite — the old one already had its outcome recorded.
@@ -476,6 +538,7 @@ class ProbeDaemon:
                 "sport":        sport,
                 "dst":          dst_name,
                 "dst_addr":     dst_ip,
+                "ip_ver":       ip_ver,
                 "probe_seq":    probe_seq,
                 "deadline_ns":  send_mono + self.args.timeout_ms * 1_000_000,
                 "matched":      False,
@@ -484,7 +547,7 @@ class ProbeDaemon:
 
         scapy_send(pkt, iface=self.args.iface, verbose=0)
         if self.args.verbose:
-            print(f"[tx]  {dst_name:<12} sport={sport} "
+            print(f"[tx]  v{ip_ver} {dst_name:<12} sport={sport} "
                   f"seq={probe_seq} tcp_seq={tcp_seq:#010x}")
 
     def _sender_loop(self):
@@ -496,9 +559,9 @@ class ProbeDaemon:
                 print("[info] --duration-s reached, stopping sender")
                 self.stop_flag = True
                 break
-            dst_name, dst_ip = self.args.target[i % len(self.args.target)]
+            dst_name, family, dst_ip = self.pairs[i % len(self.pairs)]
             try:
-                self._send_one(dst_name, dst_ip)
+                self._send_one(dst_name, family, dst_ip)
             except Exception as e:
                 print(f"[send err] {dst_name} {dst_ip}: {e}")
             i += 1
@@ -530,13 +593,14 @@ class ProbeDaemon:
                 ts_iso    = iso_utc(v["send_wall"]),
                 dst       = v["dst"],
                 dst_ip    = v["dst_addr"],
+                ip_ver    = v["ip_ver"],
                 probe_seq = v["probe_seq"],
                 rtt_ms    = None,
                 ok        = False,
             )
             if self.args.verbose:
-                print(f"[to]  {v['dst']:<12} sport={v['sport']} "
-                      f"seq={v['probe_seq']} TIMEOUT")
+                print(f"[to]  v{v['ip_ver']} {v['dst']:<12} "
+                      f"sport={v['sport']} seq={v['probe_seq']} TIMEOUT")
 
     # ---- main poll loop ----
     def run(self):
@@ -551,8 +615,13 @@ class ProbeDaemon:
         signal.signal(signal.SIGINT,  _sig)
         signal.signal(signal.SIGTERM, _sig)
 
-        print(f"[info] daemon started. src={self.src_name}({self.src_ip}) "
-              f"targets={[x[0] for x in self.args.target]} "
+        pair_summary = ",".join(
+            f"{n}/v{4 if f == socket.AF_INET else 6}"
+            for (n, f, _ip) in self.pairs
+        )
+        print(f"[info] daemon started. src={self.src_name} "
+              f"v4={self.src_ip_v4} v6={self.src_ip_v6} "
+              f"pairs=[{pair_summary}] "
               f"interval={self.args.interval_ms}ms "
               f"timeout={self.args.timeout_ms}ms "
               f"sink={self.args.sink} "
@@ -602,6 +671,7 @@ class ProbeDaemon:
                     ts_iso    = iso_utc(v["send_wall"]),
                     dst       = v["dst"],
                     dst_ip    = v["dst_addr"],
+                    ip_ver    = v["ip_ver"],
                     probe_seq = v["probe_seq"],
                     rtt_ms    = None,
                     ok        = False,
@@ -626,7 +696,9 @@ def main():
                     default="generic")
     ap.add_argument("--target", action="append", type=parse_target,
                     required=True,
-                    help="one or more name=ipv4 targets, e.g. hongkong=1.2.3.4")
+                    help="one or more name=ip[,ip] targets. Each may specify "
+                         "an IPv4, an IPv6, or both (comma-separated). "
+                         "Example: hongkong=1.2.3.4,2402:xxxx::1")
     ap.add_argument("--dport", type=int, default=22)
     ap.add_argument("--sport", type=int, default=DEFAULT_SPORT,
                     help=f"fixed source port for every SYN; must equal "
