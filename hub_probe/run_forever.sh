@@ -35,6 +35,10 @@ TIMEOUT_MS=3000
 BATCH_SIZE=1000
 BATCH_INTERVAL_S=300
 
+# Business label for this HUB, written to probe_sample.src.
+# Do NOT rely on hostname (the box is named VM-0-15-ubuntu which is meaningless).
+SRC_NAME="bangkok"
+
 # Fixed peer list. Names are free-form labels stored in probe_sample.dst_name.
 TARGETS=(
   "hongkong=43.132.210.4"
@@ -107,6 +111,7 @@ PYEOF
   done
 
   echo "=========== run_forever.sh start ==========="
+  echo "src_name    = $SRC_NAME"
   echo "iface       = $IFACE"
   echo "targets     = ${TARGETS[*]}"
   echo "interval    = ${INTERVAL_MS}ms"
@@ -129,6 +134,7 @@ PYEOF
       --iface "$IFACE" \
       --obj "$OBJ" \
       --mode generic \
+      --src-name "$SRC_NAME" \
       "${TARGET_ARGS[@]}" \
       --interval-ms "$INTERVAL_MS" \
       --timeout-ms "$TIMEOUT_MS" \
