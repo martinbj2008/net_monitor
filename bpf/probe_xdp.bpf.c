@@ -19,6 +19,21 @@
 
 #include "probe_xdp.h"
 
+/* vmlinux.h contains only struct/typedef, not uapi #defines. Provide the
+ * few constants we need explicitly so we don't drag in <linux/*.h>. */
+#ifndef ETH_P_IP
+#define ETH_P_IP        0x0800
+#endif
+#ifndef IPPROTO_TCP
+#define IPPROTO_TCP     6
+#endif
+#ifndef XDP_PASS
+#define XDP_PASS        2
+#endif
+#ifndef XDP_DROP
+#define XDP_DROP        1
+#endif
+
 char LICENSE[] SEC("license") = "GPL";
 
 /* 256 KB ringbuf — at ~8 pps * 24 B = 200 B/s this holds ~20 min of events.
