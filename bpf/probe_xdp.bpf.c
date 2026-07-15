@@ -1,17 +1,27 @@
-/* probe_xdp.bpf.c — Step 2 skeleton.
+/* probe_xdp.bpf.c — Step 3: filter + drop probe SYN-ACKs.
  *
- * Purpose in Step 2 (this file):
- *   - Verify the full toolchain end-to-end: compile -> load -> attach ->
- *     ringbuf event -> userspace decode -> detach.
- *   - Report EVERY inbound TCP packet as a probe_event to a ringbuf and
- *     return XDP_PASS. No filtering. No drop. This is DELIBERATE:
- *       * we must never risk dropping ssh in the scaffold stage;
- *       * seeing our own ssh packets show up is proof the pipeline works.
+ * Role in the probe pipeline:
+ *   hub sends SYN from an ephemeral src port in [65408..65423] toward leaf:22
+ *   leaf's TCP stack replies with SYN|ACK (leaf:22 -> hub:65408..65423)
+ *   this XDP prog intercepts that inbound SYN|ACK, emits a probe_event, and
+ *   returns XDP_DROP so hub's own TCP stack never sees the SA and therefore
+ *   never sends a RST back — leaf's half-open queue drains normally on its
+ *   own timeout, ssh stays untouched.
  *
- * In Step 3 we will add:
- *   - filter: only SYN|ACK responses to our probe port range 65408-65423
- *   - action: XDP_DROP those SYN|ACKs so the kernel never sends RST back
- *   - saddr allowlist for the 3 leaf IPs (deferred; not needed now)
+ * Match criteria (ALL must hold):
+ *   - IPv4 + TCP
+ *   - dport (host order) in [65408, 65423]  (hub-side ephemeral, sysctl-reserved)
+ *   - flags & (SYN|ACK|RST) == (SYN|ACK)    (proper SA, not RST, not just ACK)
+ *
+ * Anything else -> XDP_PASS. In particular:
+ *   - RST packets (even inside the port window) pass through, so if the peer
+ *     ever sends RST we still see it via normal tools (tcpdump/netstat) for
+ *     diagnosis; XDP is not silently eating diagnostic signal.
+ *   - ssh, metadata, DNS, and every other flow is untouched.
+ *
+ * saddr allowlist for the 3 leaf IPs is intentionally NOT enforced here.
+ * The 16 reserved ports are ours exclusively, so any SA landing on them
+ * must be a response to our probe.
  */
 #include "vmlinux.h"          /* CO-RE kernel types via BTF                */
 #include <bpf/bpf_helpers.h>
@@ -71,6 +81,28 @@ int probe_xdp(struct xdp_md *ctx)
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
+    /* --- Step 3 filter: only probe SYN-ACKs get intercepted. --- */
+
+    /* dport window: hub-side ephemeral ports reserved via ip_local_reserved_ports.
+     * tcp->dest is network byte order; compare in host order for readability. */
+    __u16 dport_h = bpf_ntohs(tcp->dest);
+    if (dport_h < 65408 || dport_h > 65423)
+        return XDP_PASS;
+
+    /* Assemble the 6-bit flag byte once; reuse below when writing the event. */
+    __u8 flags = 0;
+    if (tcp->fin) flags |= 0x01;
+    if (tcp->syn) flags |= 0x02;
+    if (tcp->rst) flags |= 0x04;
+    if (tcp->psh) flags |= 0x08;
+    if (tcp->ack) flags |= 0x10;
+    if (tcp->urg) flags |= 0x20;
+
+    /* Must be exactly SYN|ACK (with RST clear). Other combos (pure ACK, RST,
+     * FIN, etc.) fall through so they remain visible to tcpdump for diag. */
+    if ((flags & (0x02 | 0x10 | 0x04)) != (0x02 | 0x10))
+        return XDP_PASS;
+
     /* Reserve on ringbuf. If full, drop the event (not the packet). */
     struct probe_event *ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
     if (!ev)
@@ -83,16 +115,6 @@ int probe_xdp(struct xdp_md *ctx)
     ev->dport     = tcp->dest;
     ev->seq       = tcp->seq;
     ev->ack_seq   = tcp->ack_seq;
-
-    /* Rebuild the classic 6-bit flag byte from the bitfields in tcphdr.
-     * vmlinux.h exposes fin/syn/rst/psh/ack/urg as 1-bit fields. */
-    __u8 flags = 0;
-    if (tcp->fin) flags |= 0x01;
-    if (tcp->syn) flags |= 0x02;
-    if (tcp->rst) flags |= 0x04;
-    if (tcp->psh) flags |= 0x08;
-    if (tcp->ack) flags |= 0x10;
-    if (tcp->urg) flags |= 0x20;
     ev->tcp_flags = flags;
 
     ev->_pad[0] = 0;
@@ -100,5 +122,8 @@ int probe_xdp(struct xdp_md *ctx)
     ev->_pad[2] = 0;
 
     bpf_ringbuf_submit(ev, 0);
-    return XDP_PASS;
+
+    /* Swallow the SA so hub's TCP stack never sees it and never generates a
+     * RST back to leaf. That is the whole point of this program. */
+    return XDP_DROP;
 }
