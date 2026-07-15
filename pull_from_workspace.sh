@@ -37,6 +37,7 @@ FILES=(
   # --- XDP Step 3 verification probe ---
   "hub_probe/step3_probe.py"
   "hub_probe/step3_run.sh"
+  "hub_probe/verify_kernel_rst.sh"
 )
 
 PUSH=1
