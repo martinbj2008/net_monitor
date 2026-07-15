@@ -1,0 +1,21 @@
+apiVersion: 1
+
+datasources:
+  - name: probe-pg
+    uid: probe-pg
+    type: postgres
+    access: proxy
+    url: ${PROBE_PG_HOST}:${PROBE_PG_PORT}
+    user: ${PROBE_PG_USER}
+    secureJsonData:
+      password: ${PROBE_PG_PASSWORD}
+    jsonData:
+      database: ${PROBE_PG_DB}
+      sslmode: disable
+      postgresVersion: 1600
+      timescaledb: false
+      maxOpenConns: 10
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    isDefault: true
+    editable: false

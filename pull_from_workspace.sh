@@ -40,6 +40,14 @@ FILES=(
   "ops/hub_verify_srcname_required.sh"
 )
 
+# --- whitelist: whole directories (mirrored with rsync-like semantics) ---
+# Anything under these dirs is mirrored 1:1; files removed in workspace are
+# also removed in this repo (via --delete on rsync).
+DIRS=(
+  # --- Postgres + Grafana docker stack (compose, .env, provisioning, dashboards) ---
+  "docker"
+)
+
 PUSH=1
 DRY=0
 for a in "$@"; do
@@ -78,6 +86,37 @@ for f in "${FILES[@]}"; do
     changed=$(( changed + 1 ))
   else
     echo "  same  $f"
+  fi
+done
+
+# --- mirror whole directories via rsync (delete removed files too) ---
+for d in "${DIRS[@]}"; do
+  src="${SRC_DIR}/${d}/"
+  dst="${SCRIPT_DIR}/${d}/"
+  if [[ ! -d "${SRC_DIR}/${d}" ]]; then
+    echo "  MISS  ${d}/  (not in workspace)"
+    missing=$(( missing + 1 ))
+    continue
+  fi
+  mkdir -p "$dst"
+  if [[ $DRY -eq 1 ]]; then
+    rsync_out=$(rsync -rlpt --delete --itemize-changes --dry-run "$src" "$dst" 2>&1 | grep -v '^\.[df]\.\.\.\.\.' || true)
+    if [[ -n "$rsync_out" ]]; then
+      echo "  DIFF  ${d}/"
+      echo "$rsync_out" | sed 's/^/        /'
+      changed=$(( changed + 1 ))
+    else
+      echo "  same  ${d}/"
+    fi
+  else
+    rsync_out=$(rsync -rlpt --delete --itemize-changes "$src" "$dst" 2>&1 | grep -v '^\.[df]\.\.\.\.\.' || true)
+    if [[ -n "$rsync_out" ]]; then
+      echo "  SYNC  ${d}/"
+      echo "$rsync_out" | sed 's/^/        /'
+      changed=$(( changed + 1 ))
+    else
+      echo "  same  ${d}/"
+    fi
   fi
 done
 

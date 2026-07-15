@@ -67,9 +67,23 @@ logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import IP, TCP, send as scapy_send  # noqa: E402
 
 # ---------- constants shared with BPF ----------
-EVENT_FMT  = "<QIIHHIIB3x"
+# v2 (2026-07): unified v4/v6 layout, 56 bytes. Must match struct probe_event
+# in bpf/probe_xdp.h exactly.
+#   <  little-endian, no padding
+#   Q  u64 ts_ns
+#   B  u8  ip_ver     (4 or 6)
+#   B  u8  tcp_flags
+#   2x _pad0[2]
+#   H  u16 sport      (network byte order)
+#   H  u16 dport      (network byte order)
+#   I  u32 seq        (network byte order)
+#   I  u32 ack_seq    (network byte order)
+#  16s saddr[16]      (network byte order; v4 uses first 4, rest 0)
+#  16s daddr[16]      (same)
+EVENT_FMT  = "<QBB2xHHII16s16s"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
-assert EVENT_SIZE == 32
+assert EVENT_SIZE == 56, f"EVENT_SIZE={EVENT_SIZE}, expected 56"
+
 
 # The XDP filter drops any inbound TCP whose dport equals PROBE_PORT. We use
 # a single reserved port so the filter is trivially exact and there's no
@@ -343,18 +357,29 @@ class ProbeDaemon:
         if size < EVENT_SIZE:
             return 0
         raw = ct.string_at(data_ptr, EVENT_SIZE)
-        ts_ns_mono, sa_be, da_be, sp_be, dp_be, seq_be, ack_be, fl \
-            = struct.unpack(EVENT_FMT, raw)
+        (ts_ns_mono, ip_ver, fl, sp_be, dp_be, seq_be, ack_be,
+         sa_bytes, da_bytes) = struct.unpack(EVENT_FMT, raw)
+
+        # Decode source address per ip_ver. v4 uses first 4 bytes of the 16B
+        # slot; v6 uses all 16. saddr on the wire is the leaf's IP.
+        if ip_ver == 4:
+            sa_src_ip = socket.inet_ntop(socket.AF_INET, sa_bytes[:4])
+            proto = "tcp_synack"
+        elif ip_ver == 6:
+            sa_src_ip = socket.inet_ntop(socket.AF_INET6, sa_bytes)
+            proto = "tcp_synack"
+        else:
+            # unknown ip_ver — ignore
+            return 0
 
         # SA fields on the wire are (leaf_ip, leaf_sport=22, hub_ip, hub_dport,
         # seq=leaf_isn, ack_seq=hub_isn+1). We keyed pending by the SYN we
-        # sent: (dst_ip=leaf_ip, dport=leaf_port=22, sport=hub_port,
-        #        ack_expected=hub_isn+1). So the lookup key is:
-        sa_src_ip   = socket.inet_ntoa(struct.pack("<I", sa_be))
+        # sent: (proto, ip_ver, dst_ip=leaf_ip, dport=leaf_port=22,
+        #        sport=hub_port, ack_expected=hub_isn+1).
         sa_src_port = socket.ntohs(sp_be)
         sa_dst_port = socket.ntohs(dp_be)
         ack_host    = socket.ntohl(ack_be) & 0xffffffff
-        key = (sa_src_ip, sa_src_port, sa_dst_port, ack_host)
+        key = (proto, ip_ver, sa_src_ip, sa_src_port, sa_dst_port, ack_host)
 
         recv_mono = time.monotonic_ns()
 
@@ -437,7 +462,11 @@ class ProbeDaemon:
         send_wall = time.time()
         send_mono = time.monotonic_ns()
 
-        key = (dst_ip, self.args.dport, sport, ack_expected)
+        # Key MUST match what _on_event builds when a reply arrives. The
+        # (proto, ip_ver) prefix is currently constant (tcp_synack/4) but is
+        # kept in the key so future v6 / icmp workers can coexist without
+        # tuple collisions.
+        key = ("tcp_synack", 4, dst_ip, self.args.dport, sport, ack_expected)
         with self.pending_lock:
             # if same key still present (e.g. sport reused before old TTL),
             # overwrite — the old one already had its outcome recorded.

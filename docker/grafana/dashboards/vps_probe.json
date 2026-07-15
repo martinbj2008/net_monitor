@@ -1,0 +1,301 @@
+{
+  "uid": "vps-probe-main",
+  "title": "VPS Probe - Latency & Loss",
+  "tags": ["vps_probe", "smokeping"],
+  "timezone": "${tz}",
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "tz",
+        "type": "custom",
+        "label": "Timezone",
+        "description": "Dashboard display timezone. Data is stored in UTC in DB; this only affects axis labels and last_seen column.",
+        "query": "UTC,Asia/Shanghai",
+        "current": { "text": "UTC", "value": "UTC" },
+        "options": [
+          { "text": "UTC",           "value": "UTC",           "selected": true  },
+          { "text": "Asia/Shanghai", "value": "Asia/Shanghai", "selected": false }
+        ]
+      },
+      {
+        "name": "src",
+        "type": "query",
+        "label": "Source",
+        "datasource": { "type": "postgres", "uid": "probe-pg" },
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "query": "SELECT DISTINCT src FROM probe_sample ORDER BY 1",
+        "sort": 1
+      },
+      {
+        "name": "dst",
+        "type": "query",
+        "label": "Destination",
+        "datasource": { "type": "postgres", "uid": "probe-pg" },
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "query": "SELECT DISTINCT dst FROM probe_sample WHERE src = '$src' ORDER BY 1",
+        "sort": 1
+      },
+      {
+        "name": "proto",
+        "type": "query",
+        "label": "Protocol",
+        "datasource": { "type": "postgres", "uid": "probe-pg" },
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "query": "SELECT DISTINCT proto FROM probe_sample ORDER BY 1",
+        "sort": 1
+      },
+      {
+        "name": "ipver",
+        "type": "custom",
+        "label": "IP Version",
+        "query": "4,6",
+        "current": { "text": "4", "value": "4" },
+        "options": [
+          { "text": "4", "value": "4", "selected": true },
+          { "text": "6", "value": "6", "selected": false }
+        ]
+      },
+      {
+        "name": "bucket",
+        "type": "custom",
+        "label": "Aggregation",
+        "query": "1min : 60,5min : 300,15min : 900,1h : 3600",
+        "current": { "text": "5min", "value": "300" },
+        "options": [
+          { "text": "1min",  "value": "60",   "selected": false },
+          { "text": "5min",  "value": "300",  "selected": true  },
+          { "text": "15min", "value": "900",  "selected": false },
+          { "text": "1h",    "value": "3600", "selected": false }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Smokeping - $src → $dst  ($proto/v$ipver)",
+      "datasource": { "type": "postgres", "uid": "probe-pg" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 0 },
+      "description": "Grey band = [min, max] RTT range (jitter). Solid line = avg RTT. Red dots on right axis = loss %. Timestamps aligned to UTC in DB; displayed per dashboard timezone.",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT to_timestamp(floor(extract(epoch FROM ts) / $bucket) * $bucket) AS \"time\",\n       min(rtt_ms) FILTER (WHERE ok) AS \"rtt_min\",\n       avg(rtt_ms) FILTER (WHERE ok) AS \"rtt_avg\",\n       max(rtt_ms) FILTER (WHERE ok) AS \"rtt_max\",\n       (1 - count(*) FILTER (WHERE ok)::float / count(*)) * 100 AS \"loss_pct\"\nFROM probe_sample\nWHERE $__timeFilter(ts)\n  AND src = '$src' AND dst = '$dst'\n  AND proto = '$proto' AND ip_ver = $ipver\nGROUP BY 1\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "auto",
+            "pointSize": 4,
+            "spanNulls": 3600000,
+            "axisPlacement": "left"
+          },
+          "unit": "ms"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "rtt_max" },
+            "properties": [
+              { "id": "custom.fillBelowTo", "value": "rtt_min" },
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.fillOpacity", "value": 25 },
+              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#808080" } },
+              { "id": "displayName", "value": "rtt_max" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "rtt_min" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#808080" } },
+              { "id": "displayName", "value": "rtt_min" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "rtt_avg" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 2 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3274d9" } },
+              { "id": "displayName", "value": "rtt_avg" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "loss_pct" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.axisLabel", "value": "loss %" },
+              { "id": "custom.drawStyle", "value": "points" },
+              { "id": "custom.pointSize", "value": 6 },
+              { "id": "custom.showPoints", "value": "always" },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#e02f44" } },
+              { "id": "max", "value": 100 },
+              { "id": "min", "value": 0 },
+              { "id": "displayName", "value": "loss %" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 2,
+      "type": "state-timeline",
+      "title": "All links - loss % state timeline",
+      "datasource": { "type": "postgres", "uid": "probe-pg" },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 12 },
+      "description": "One row per (src→dst, proto/vN). Green=healthy, yellow/orange/red=loss level. Gaps mean no samples in that bucket.",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT to_timestamp(floor(extract(epoch FROM ts) / $bucket) * $bucket) AS \"time\",\n       src || ' -> ' || dst || '  ' || proto || '/v' || ip_ver AS metric,\n       (1 - count(*) FILTER (WHERE ok)::float / count(*)) * 100 AS value\nFROM probe_sample\nWHERE $__timeFilter(ts)\nGROUP BY 1, 2\nORDER BY 2, 1"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "prepareTimeSeries",
+          "options": { "format": "many" }
+        }
+      ],
+      "options": {
+        "mergeValues": false,
+        "showValue": "never",
+        "alignValue": "left",
+        "rowHeight": 0.9,
+        "legend": { "displayMode": "hidden", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single", "sort": "none" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "custom": { "lineWidth": 0, "fillOpacity": 90 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "orange", "value": 5 },
+              { "color": "red",    "value": 20 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Current state (last 10 min)",
+      "datasource": { "type": "postgres", "uid": "probe-pg" },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 26 },
+      "description": "Aggregated over the last 10 minutes. last_seen is in dashboard timezone ($tz).",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT src,\n       dst,\n       proto,\n       ip_ver,\n       count(*) AS sent,\n       count(*) FILTER (WHERE ok) AS recv,\n       round(((1 - count(*) FILTER (WHERE ok)::float / count(*)) * 100)::numeric, 2) AS \"loss_%\",\n       round(min(rtt_ms) FILTER (WHERE ok)::numeric, 1) AS \"min_ms\",\n       round(avg(rtt_ms) FILTER (WHERE ok)::numeric, 1) AS \"avg_ms\",\n       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY rtt_ms) FILTER (WHERE ok)::numeric, 1) AS \"p95_ms\",\n       round(max(rtt_ms) FILTER (WHERE ok)::numeric, 1) AS \"max_ms\",\n       to_char(max(ts) AT TIME ZONE '$tz', 'MM-DD HH24:MI:SS') AS last_seen\nFROM probe_sample\nWHERE ts >= now() - interval '10 minutes'\nGROUP BY src, dst, proto, ip_ver\nORDER BY \"loss_%\" DESC, \"avg_ms\" DESC"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false, "reducer": ["sum"], "fields": [] }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "displayMode": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "loss_%" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.displayMode", "value": "color-background" },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 1 },
+                    { "color": "orange", "value": 5 },
+                    { "color": "red", "value": 20 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "avg_ms" },
+            "properties": [
+              { "id": "unit", "value": "ms" },
+              { "id": "custom.displayMode", "value": "gradient-gauge" },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 100 },
+                    { "color": "orange", "value": 200 },
+                    { "color": "red", "value": 400 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p95_ms" },
+            "properties": [ { "id": "unit", "value": "ms" } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "min_ms" },
+            "properties": [ { "id": "unit", "value": "ms" } ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "max_ms" },
+            "properties": [ { "id": "unit", "value": "ms" } ]
+          }
+        ]
+      }
+    }
+  ]
+}
