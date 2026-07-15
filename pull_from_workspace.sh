@@ -23,30 +23,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # --- whitelist: files (relative to SRC_DIR) to mirror into this repo ---
+# NOTE: legacy VPS-side scripts, step3/step4 one-shot runners, XDP verifiers
+# and same-sport experiments have all been retired. Current production stack
+# on the HUB is just: XDP RST-dropper + probe_daemon.py + run_forever.sh, all
+# writing directly to local Postgres.
 FILES=(
-  "verify_synack.sh"
-  "verify_synack_scapy.py"
-  "hub_sysctl_reserve_ports.sh"
-  "xdp_env_check.sh"
-  "tcp_probe_diag.sh"
-  # --- XDP Step 2 scaffold ---
+  # --- XDP RST dropper (loaded by probe_daemon on startup) ---
   "bpf/probe_xdp.h"
   "bpf/probe_xdp.bpf.c"
   "bpf/Makefile"
-  "hub_probe/test_loader.py"
-  # --- XDP Step 3 verification probe ---
-  "hub_probe/step3_probe.py"
-  "hub_probe/step3_run.sh"
-  "hub_probe/verify_kernel_rst.sh"
-  "hub_probe/verify_rst_dropper.sh"
-  # --- XDP Step 4: unified probe daemon (direct PG sink) ---
+  # --- unified probe daemon (direct PG sink) ---
   "hub_probe/probe_daemon.py"
-  "hub_probe/step4_run.sh"
   "hub_probe/run_forever.sh"
-  # --- experiments ---
-  "hub_probe/exp_same_sport.py"
-  # --- ops / one-off cleanup scripts (run on hub + all leaves) ---
+  # --- ops / one-off cleanup + verification scripts ---
   "ops/cleanup_legacy_vps_probe.sh"
+  "ops/hub_verify_srcname_required.sh"
 )
 
 PUSH=1

@@ -47,7 +47,7 @@ TARGETS=(
 )
 
 # PG DSN. Password sourced from `docker inspect probe_pg` on this HUB.
-# probe_pg listens on 127.0.0.1:25432 and 10.0.0.1:25432 (wg).
+# probe_pg listens on 127.0.0.1:25432 (localhost only after wg retirement).
 PROBE_PG_DSN="postgresql://probe:jPPErRzPbz0cMo2r8TfM1MD4@127.0.0.1:25432/probe"
 
 LOG_FILE="/var/log/probe_daemon.log"
