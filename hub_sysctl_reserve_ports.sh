@@ -17,15 +17,28 @@
 #   sees it. sysctl reservation and XDP interception are orthogonal.
 #
 # Range:
-#   65408-65535 (last 128 ports of the ephemeral space)
-#   Program actually uses 65408-65423 (first 16); rest is headroom.
+#   65400-65535 (last 136 ports of the ephemeral space) — kept reserved as
+#   a headroom "black hole" so the kernel never auto-assigns anything here.
+#   Rounded down to 65400 for a clean boundary with a bit of extra headroom.
+#
+#   CURRENT USAGE:
+#     * :65535  — SYN-probe RTT measurement (fixed sport of the probe daemon;
+#                 XDP matches inbound TCP dport==65535 and drops it).
+#     * :65400..:65534 — reserved but IDLE. Not used by anything yet.
+#
+#   Do NOT shrink this range or release the idle ports back to the ephemeral
+#   pool. They stay carved out so future probe experiments (extra sports,
+#   parallel A/B ports, side-channel probes) can plug in without needing
+#   another sysctl change / reboot.
 #
 # Idempotent: safe to re-run. `remove` reverses.
 
 set -euo pipefail
 
 CONF="/etc/sysctl.d/99-vps-probe.conf"
-PORT_RANGE="65408-65535"
+# Reserve the whole 136-port window even though only :65535 is in active use.
+# See "Range:" note above before touching this.
+PORT_RANGE="65400-65535"
 KEY="net.ipv4.ip_local_reserved_ports"
 
 need_root() {

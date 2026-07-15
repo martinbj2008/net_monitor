@@ -10,15 +10,27 @@
 #   * SA-retransmission accounting (so leaf's re-tx SAs aren't miscounted)
 #
 # --- Match strategy ---
-# Every SYN we send carries a deterministic seq = SEQ_BASE + counter, plus a
-# rotating sport in [65408..65423]. The leaf's SYN-ACK will carry
-# ack_seq = seq + 1. The pending map is keyed by the full 4-tuple identifying
-# our SYN uniquely on the wire:
-#     (dst_ip, dport, sport, ack_expected)
+# Every SYN we send from hub uses a FIXED sport (default 65535, configurable
+# via --sport) toward leaf:22. seq starts at a random 32-bit value picked at
+# process startup and increments by SEQ_STEP (5000) per probe, wrapping
+# naturally in the 32-bit space; not persisted across restarts.
+#
+# Because sport is fixed, the 4-tuple on the wire is identical every probe;
+# the only thing distinguishing probes is seq. The pending map is therefore
+# still keyed by the full identifier of a specific SYN's expected reply:
+#     (dst_ip, dport, sport, ack_expected)   with ack_expected = seq + 1
+# so different probes still get different keys.
+#
 # When XDP fires, we take (SA.saddr, SA.sport, SA.dport, SA.ack_seq) and look
 # it up. First match records RTT. Later hits on the same key are counted as
 # leaf-side SA retransmissions (leaf keeps re-sending SA every ~1-32s until
 # our half-open TCB is either ACKed or expires).
+#
+# NOTE: reusing one sport at 1Hz will keep leaf's half-open TCB warm; each
+# subsequent SYN with a jumped seq lands out-of-window on that TCB and elicits
+# challenge-ACK / RST-ACK rather than a fresh SYN-ACK. XDP swallows those on
+# hub side, and userspace matches on ack_seq regardless of flag combo, so
+# they're still valid RTT samples.
 #
 # --- Sink ---
 # Default: batched INSERT into Postgres. Buffer flushes when either
@@ -39,6 +51,7 @@ import ctypes as ct
 import datetime as dt
 import ipaddress
 import os
+import secrets
 import signal
 import socket
 import struct
@@ -58,11 +71,20 @@ EVENT_FMT  = "<QIIHHIIB3x"
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
 assert EVENT_SIZE == 32
 
-SPORT_LO   = 65408
-SPORT_HI   = 65423   # inclusive
-SPORT_SPAN = SPORT_HI - SPORT_LO + 1
+# The XDP filter drops any inbound TCP whose dport equals PROBE_PORT. We use
+# a single reserved port so the filter is trivially exact and there's no
+# "dead window" of unused reserved ports.
+PROBE_PORT = 65535
 
-SEQ_BASE   = 0x10000000
+# Fixed sport used by every SYN. Must equal PROBE_PORT so that XDP on
+# hub-side catches (and drops) the replies before the local TCP stack gets
+# a chance to emit its own RST toward leaf.
+DEFAULT_SPORT = PROBE_PORT
+
+# seq step per probe. Big enough that any reasonable in-flight TCP window on
+# a half-open state at leaf can't accidentally cover two consecutive probes'
+# seq numbers, small enough that 32-bit wrap doesn't matter in practice.
+SEQ_STEP = 5000
 
 # how long we keep a matched entry around so leaf SA retransmissions can be
 # recognized as "retrans" instead of "orphan"
@@ -215,6 +237,12 @@ class ProbeDaemon:
 
         self.batch_ts_wall = time.time()
         self.batch_ts_iso  = iso_utc(self.batch_ts_wall)
+
+        # seq state: random 32-bit start per process, +SEQ_STEP each probe,
+        # natural 32-bit wrap, no persistence across restarts.
+        self._seq_cursor = secrets.randbits(32)
+        print(f"[init] seq start=0x{self._seq_cursor:08x} step={SEQ_STEP} "
+              f"sport={args.sport}")
 
         # pending: key(4-tuple) -> row-in-flight; matched=True means SA seen
         # (kept for MATCHED_TTL_S so retransmitted SAs get counted correctly).
@@ -390,8 +418,10 @@ class ProbeDaemon:
         probe_seq = self.n_sent
         self.n_sent += 1
 
-        sport = SPORT_LO + (probe_seq % SPORT_SPAN)
-        tcp_seq = (SEQ_BASE + probe_seq) & 0xffffffff
+        # Fixed sport, seq walks by SEQ_STEP per probe with natural 32-bit wrap.
+        sport = self.args.sport
+        tcp_seq = self._seq_cursor
+        self._seq_cursor = (self._seq_cursor + SEQ_STEP) & 0xffffffff
         ack_expected = (tcp_seq + 1) & 0xffffffff
 
         pkt = IP(src=self.src_ip, dst=dst_ip) / \
@@ -564,6 +594,10 @@ def main():
                     required=True,
                     help="one or more name=ipv4 targets, e.g. hongkong=1.2.3.4")
     ap.add_argument("--dport", type=int, default=22)
+    ap.add_argument("--sport", type=int, default=DEFAULT_SPORT,
+                    help=f"fixed source port for every SYN; must equal "
+                         f"PROBE_PORT ({PROBE_PORT}) so XDP catches replies. "
+                         f"default {DEFAULT_SPORT}")
     ap.add_argument("--src-name", default=None,
                     help="src label written to DB (default: hostname)")
     ap.add_argument("--interval-ms", type=int, default=1000,
@@ -588,6 +622,13 @@ def main():
     if os.geteuid() != 0:
         print("must run as root (XDP + raw send)", file=sys.stderr)
         sys.exit(1)
+
+    if not (args.sport == PROBE_PORT):
+        print(f"--sport={args.sport} does not match XDP PROBE_PORT "
+              f"({PROBE_PORT}); XDP will NOT catch replies and leaf will "
+              f"see hub-kernel RSTs. refuse to start.",
+              file=sys.stderr)
+        sys.exit(2)
 
     ProbeDaemon(args).run()
 

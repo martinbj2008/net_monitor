@@ -2,7 +2,7 @@
  *                   dport falls into the hub's reserved probe window.
  *
  * Role in the probe pipeline:
- *   hub sends SYN from an ephemeral src port in [65408..65423] toward leaf:22
+ *   hub sends SYN from a single reserved src port (65535) toward leaf:22
  *   leaf's TCP stack replies with something (SYN|ACK on happy path, but also
  *   possibly RST|ACK / RST / retransmitted SA / etc. depending on the leaf's
  *   half-open state, e.g. when we send several SYNs from the same sport with
@@ -14,7 +14,7 @@
  *
  * Match criteria (ALL must hold):
  *   - IPv4 + TCP
- *   - dport (host order) in [65408, 65423]  (hub-side ephemeral, sysctl-reserved)
+ *   - dport (host order) == 65535  (hub-side sysctl-reserved probe port)
  *
  * On match:
  *   - Emit a probe_event on the ringbuf with the raw TCP flag byte, seq,
@@ -24,8 +24,8 @@
  *     the leaf's half-open bookkeeping undisturbed and lets us safely probe
  *     with the same sport across multiple SYNs.
  *
- * The 16 reserved ports are ours exclusively (sysctl ip_local_reserved_ports
- * plus firewalled outbound), so any TCP hitting them is a probe reply.
+ * Port 65535 is ours exclusively (sysctl ip_local_reserved_ports plus
+ * firewalled outbound), so any TCP hitting it is a probe reply.
  */
 #include "vmlinux.h"          /* CO-RE kernel types via BTF                */
 #include <bpf/bpf_helpers.h>
@@ -85,12 +85,12 @@ int probe_xdp(struct xdp_md *ctx)
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    /* --- Step 3 filter: dport window only. Flag combos are all captured. --- */
+    /* --- Step 3 filter: single dport only. Flag combos are all captured. --- */
 
-    /* dport window: hub-side ephemeral ports reserved via ip_local_reserved_ports.
+    /* dport: hub-side probe port reserved via ip_local_reserved_ports.
      * tcp->dest is network byte order; compare in host order for readability. */
     __u16 dport_h = bpf_ntohs(tcp->dest);
-    if (dport_h < 65408 || dport_h > 65423)
+    if (dport_h != 65535)
         return XDP_PASS;
 
     /* Assemble the flag byte for reporting. We deliberately do NOT gate on
