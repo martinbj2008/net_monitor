@@ -1,27 +1,31 @@
-/* probe_xdp.bpf.c — Step 3: filter + drop probe SYN-ACKs.
+/* probe_xdp.bpf.c — Step 3: filter + drop every inbound TCP packet whose
+ *                   dport falls into the hub's reserved probe window.
  *
  * Role in the probe pipeline:
  *   hub sends SYN from an ephemeral src port in [65408..65423] toward leaf:22
- *   leaf's TCP stack replies with SYN|ACK (leaf:22 -> hub:65408..65423)
- *   this XDP prog intercepts that inbound SYN|ACK, emits a probe_event, and
- *   returns XDP_DROP so hub's own TCP stack never sees the SA and therefore
- *   never sends a RST back — leaf's half-open queue drains normally on its
- *   own timeout, ssh stays untouched.
+ *   leaf's TCP stack replies with something (SYN|ACK on happy path, but also
+ *   possibly RST|ACK / RST / retransmitted SA / etc. depending on the leaf's
+ *   half-open state, e.g. when we send several SYNs from the same sport with
+ *   jumping seq numbers). We do NOT try to be clever about the flag byte in
+ *   the kernel: userspace matches on ack_seq == our_syn_seq+1 anyway, so any
+ *   reply landing on the right dport with the right ack is by definition our
+ *   probe's echo. Filtering on flags here would only lose signal in the
+ *   edge cases we specifically want to measure.
  *
  * Match criteria (ALL must hold):
  *   - IPv4 + TCP
  *   - dport (host order) in [65408, 65423]  (hub-side ephemeral, sysctl-reserved)
- *   - flags & (SYN|ACK|RST) == (SYN|ACK)    (proper SA, not RST, not just ACK)
  *
- * Anything else -> XDP_PASS. In particular:
- *   - RST packets (even inside the port window) pass through, so if the peer
- *     ever sends RST we still see it via normal tools (tcpdump/netstat) for
- *     diagnosis; XDP is not silently eating diagnostic signal.
- *   - ssh, metadata, DNS, and every other flow is untouched.
+ * On match:
+ *   - Emit a probe_event on the ringbuf with the raw TCP flag byte, seq,
+ *     ack_seq, and 4-tuple. Userspace does the ack_seq bookkeeping.
+ *   - Return XDP_DROP so hub's own TCP stack never sees the reply and never
+ *     emits anything (RST, challenge-ACK, etc.) back to the leaf. That keeps
+ *     the leaf's half-open bookkeeping undisturbed and lets us safely probe
+ *     with the same sport across multiple SYNs.
  *
- * saddr allowlist for the 3 leaf IPs is intentionally NOT enforced here.
- * The 16 reserved ports are ours exclusively, so any SA landing on them
- * must be a response to our probe.
+ * The 16 reserved ports are ours exclusively (sysctl ip_local_reserved_ports
+ * plus firewalled outbound), so any TCP hitting them is a probe reply.
  */
 #include "vmlinux.h"          /* CO-RE kernel types via BTF                */
 #include <bpf/bpf_helpers.h>
@@ -81,7 +85,7 @@ int probe_xdp(struct xdp_md *ctx)
     if ((void *)(tcp + 1) > data_end)
         return XDP_PASS;
 
-    /* --- Step 3 filter: only probe SYN-ACKs get intercepted. --- */
+    /* --- Step 3 filter: dport window only. Flag combos are all captured. --- */
 
     /* dport window: hub-side ephemeral ports reserved via ip_local_reserved_ports.
      * tcp->dest is network byte order; compare in host order for readability. */
@@ -89,7 +93,10 @@ int probe_xdp(struct xdp_md *ctx)
     if (dport_h < 65408 || dport_h > 65423)
         return XDP_PASS;
 
-    /* Assemble the 6-bit flag byte once; reuse below when writing the event. */
+    /* Assemble the flag byte for reporting. We deliberately do NOT gate on
+     * (SYN|ACK) vs (RST|ACK) etc. here — userspace matches on ack_seq and
+     * the 4-tuple, so any TCP reply landing in this dport window with the
+     * right ack is our probe's echo, regardless of flag combo. */
     __u8 flags = 0;
     if (tcp->fin) flags |= 0x01;
     if (tcp->syn) flags |= 0x02;
@@ -97,11 +104,6 @@ int probe_xdp(struct xdp_md *ctx)
     if (tcp->psh) flags |= 0x08;
     if (tcp->ack) flags |= 0x10;
     if (tcp->urg) flags |= 0x20;
-
-    /* Must be exactly SYN|ACK (with RST clear). Other combos (pure ACK, RST,
-     * FIN, etc.) fall through so they remain visible to tcpdump for diag. */
-    if ((flags & (0x02 | 0x10 | 0x04)) != (0x02 | 0x10))
-        return XDP_PASS;
 
     /* Reserve on ringbuf. If full, drop the event (not the packet). */
     struct probe_event *ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
@@ -123,7 +125,9 @@ int probe_xdp(struct xdp_md *ctx)
 
     bpf_ringbuf_submit(ev, 0);
 
-    /* Swallow the SA so hub's TCP stack never sees it and never generates a
-     * RST back to leaf. That is the whole point of this program. */
+    /* Swallow the reply so hub's TCP stack never sees it — the kernel must
+     * not emit anything (RST, challenge-ACK, ...) back to the leaf. This is
+     * what lets us safely probe the same sport multiple times without
+     * corrupting the leaf's half-open queue. */
     return XDP_DROP;
 }
