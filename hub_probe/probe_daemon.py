@@ -4,34 +4,37 @@
 # Combines the roles of Step 2 (XDP loader + ringbuf reader) and Step 3
 # (SYN sender + verification sniffer) into one long-running process, and
 # adds:
-#   * per-probe RTT calculation via TCP seq/ack_seq matching
-#   * CSV output in the schema of docker/postgres/initdb/01_schema.sql
+#   * per-probe RTT via 4-tuple + ack_seq matching
+#   * in-memory buffered inserts into Postgres probe_sample (or stdout for debug)
 #   * per-target timeout accounting (so loss% is measurable)
+#   * SA-retransmission accounting (so leaf's re-tx SAs aren't miscounted)
 #
 # --- Match strategy ---
-# Every SYN we send carries a deterministic seq = SEQ_BASE + counter, and the
-# leaf's SYN-ACK will carry ack_seq = seq + 1. dport (hub-side ephemeral) is
-# recycled through [65408..65423], so seq is the only reliable per-probe key.
-# We maintain a pending_map keyed by ack_seq -> (send_ts_ns_monotonic,
-# send_ts_wall, sport, dst_ip, dst_name, probe_seq).
+# Every SYN we send carries a deterministic seq = SEQ_BASE + counter, plus a
+# rotating sport in [65408..65423]. The leaf's SYN-ACK will carry
+# ack_seq = seq + 1. The pending map is keyed by the full 4-tuple identifying
+# our SYN uniquely on the wire:
+#     (dst_ip, dport, sport, ack_expected)
+# When XDP fires, we take (SA.saddr, SA.sport, SA.dport, SA.ack_seq) and look
+# it up. First match records RTT. Later hits on the same key are counted as
+# leaf-side SA retransmissions (leaf keeps re-sending SA every ~1-32s until
+# our half-open TCB is either ACKed or expires).
 #
-# --- CSV columns (aligned with probe_sample) ---
-#   ts_iso, src, dst, dst_addr, proto, ip_ver, seq, rtt_ms, ok, batch_ts_iso
+# --- Sink ---
+# Default: batched INSERT into Postgres. Buffer flushes when either
+# --batch-size rows accumulate OR --batch-interval-s elapses. --sink stdout
+# just prints rows without touching a DB — used during dev/debug.
 #
 # --- Usage on hub ---
 #   sudo python3 probe_daemon.py \
 #     --iface eth0 \
 #     --target hongkong=43.132.210.4 \
-#     --target virginia=170.106.106.161 \
 #     --src-name bangkok \
 #     --interval-ms 1000 --duration-s 60 \
-#     --csv /var/log/vps_probe/rtt.csv
-#
-# Multiple --target args allowed. Each interval fires one SYN per target in
-# round-robin. XDP is attached at startup, detached on exit (ctrl-c/SIGTERM).
+#     --sink pg \
+#     --pg-dsn 'postgresql://probe:PASS@127.0.0.1:25432/probe'
 
 import argparse
-import csv
 import ctypes as ct
 import datetime as dt
 import ipaddress
@@ -60,6 +63,10 @@ SPORT_HI   = 65423   # inclusive
 SPORT_SPAN = SPORT_HI - SPORT_LO + 1
 
 SEQ_BASE   = 0x10000000
+
+# how long we keep a matched entry around so leaf SA retransmissions can be
+# recognized as "retrans" instead of "orphan"
+MATCHED_TTL_S = 40.0   # covers Linux default SA retransmit window (~31s)
 
 # ---------- libbpf ctypes bindings ----------
 LIBBPF_CANDIDATES = [
@@ -137,6 +144,64 @@ def iso_utc(ts_wall: float) -> str:
     return dt.datetime.fromtimestamp(ts_wall, dt.timezone.utc)\
              .isoformat(timespec="microseconds")
 
+# ---------- sinks ----------
+INSERT_SQL = """
+INSERT INTO probe_sample
+  (ts, src, dst, dst_addr, proto, ip_ver, seq, rtt_ms, ok, batch_ts)
+VALUES %s
+ON CONFLICT (ts, src, dst, proto, ip_ver) DO NOTHING
+"""
+
+class StdoutSink:
+    def __init__(self):
+        self.total = 0
+    def flush(self, rows):
+        for r in rows:
+            print(f"[row] {r}")
+        self.total += len(rows)
+    def close(self): pass
+
+class PgSink:
+    def __init__(self, dsn: str):
+        import psycopg2               # lazy import so --sink stdout works w/o
+        import psycopg2.extras        # psycopg2 installed
+        self._psycopg2 = psycopg2
+        self._extras   = psycopg2.extras
+        self.dsn = dsn
+        self.conn = None
+        self.total = 0
+        self._connect()
+
+    def _connect(self):
+        self.conn = self._psycopg2.connect(self.dsn)
+        self.conn.autocommit = False
+
+    def flush(self, rows):
+        if not rows: return
+        # retry once on connection loss
+        for attempt in range(2):
+            try:
+                with self.conn:
+                    with self.conn.cursor() as cur:
+                        self._extras.execute_values(
+                            cur, INSERT_SQL, rows, page_size=500)
+                self.total += len(rows)
+                return
+            except self._psycopg2.OperationalError as e:
+                print(f"[pg] operational error (attempt {attempt+1}): {e}",
+                      file=sys.stderr)
+                try: self.conn.close()
+                except Exception: pass
+                time.sleep(1.0)
+                self._connect()
+        print(f"[pg] FAILED to flush {len(rows)} rows after retry — "
+              f"dropping to avoid unbounded memory", file=sys.stderr)
+
+    def close(self):
+        try:
+            if self.conn: self.conn.close()
+        except Exception: pass
+
 # ---------- main daemon ----------
 class ProbeDaemon:
     def __init__(self, args):
@@ -151,28 +216,33 @@ class ProbeDaemon:
         self.batch_ts_wall = time.time()
         self.batch_ts_iso  = iso_utc(self.batch_ts_wall)
 
-        # pending: ack_seq_expected -> row dict
+        # pending: key(4-tuple) -> row-in-flight; matched=True means SA seen
+        # (kept for MATCHED_TTL_S so retransmitted SAs get counted correctly).
         self.pending_lock = threading.Lock()
         self.pending = {}
+
+        # buffered rows waiting to be flushed to sink
+        self.buffer_lock = threading.Lock()
+        self.buffer = []
+        self.last_flush = time.monotonic()
 
         # counters
         self.n_sent = 0
         self.n_matched = 0
         self.n_timeout = 0
-        self.n_unknown_sa = 0    # SA came in but no pending entry
+        self.n_sa_retrans = 0   # SA arrived, tuple known + already matched
+        self.n_sa_orphan  = 0   # SA arrived, tuple not in pending map at all
 
-        # CSV
-        csv_path = Path(args.csv)
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        new_file = not csv_path.exists() or csv_path.stat().st_size == 0
-        self.csv_fh = open(csv_path, "a", buffering=1, newline="")
-        self.csv_w  = csv.writer(self.csv_fh)
-        if new_file:
-            self.csv_w.writerow([
-                "ts_iso", "src", "dst", "dst_addr",
-                "proto", "ip_ver", "seq", "rtt_ms", "ok",
-                "batch_ts_iso",
-            ])
+        # sink
+        if args.sink == "pg":
+            if not args.pg_dsn:
+                raise RuntimeError("--sink pg requires --pg-dsn or "
+                                   "$PROBE_PG_DSN")
+            self.sink = PgSink(args.pg_dsn)
+        elif args.sink == "stdout":
+            self.sink = StdoutSink()
+        else:
+            raise RuntimeError(f"unknown sink: {args.sink}")
 
         # BPF state
         self.obj = None
@@ -243,42 +313,81 @@ class ProbeDaemon:
         ts_ns_mono, sa_be, da_be, sp_be, dp_be, seq_be, ack_be, fl \
             = struct.unpack(EVENT_FMT, raw)
 
-        ack_host = socket.ntohl(ack_be) & 0xffffffff
+        # SA fields on the wire are (leaf_ip, leaf_sport=22, hub_ip, hub_dport,
+        # seq=leaf_isn, ack_seq=hub_isn+1). We keyed pending by the SYN we
+        # sent: (dst_ip=leaf_ip, dport=leaf_port=22, sport=hub_port,
+        #        ack_expected=hub_isn+1). So the lookup key is:
+        sa_src_ip   = socket.inet_ntoa(struct.pack("<I", sa_be))
+        sa_src_port = socket.ntohs(sp_be)
+        sa_dst_port = socket.ntohs(dp_be)
+        ack_host    = socket.ntohl(ack_be) & 0xffffffff
+        key = (sa_src_ip, sa_src_port, sa_dst_port, ack_host)
+
         recv_mono = time.monotonic_ns()
 
         with self.pending_lock:
-            row = self.pending.pop(ack_host, None)
-
-        if row is None:
-            # SA arrived we didn't send for — could be stray or after timeout
-            self.n_unknown_sa += 1
-            return 0
+            row = self.pending.get(key)
+            if row is None:
+                self.n_sa_orphan += 1
+                return 0
+            if row.get("matched"):
+                # leaf re-sent the SA; ignore, but count
+                self.n_sa_retrans += 1
+                return 0
+            row["matched"]     = True
+            row["match_mono"]  = recv_mono
 
         rtt_ns = recv_mono - row["send_mono_ns"]
-        rtt_ms = round(rtt_ns / 1e6, 3)
+        rtt_ms = rtt_ns / 1e6
         self.n_matched += 1
 
-        # verify src ip matches (defensive)
-        sa_ip = socket.inet_ntoa(struct.pack("<I", sa_be))
-        if sa_ip != row["dst_addr"]:
-            # unlikely; keep going but note it
-            print(f"[warn] SA src {sa_ip} != expected {row['dst_addr']} "
-                  f"for ack={ack_host:#x}")
+        self._enqueue_row(
+            ts_iso  = iso_utc(row["send_wall"]),
+            dst     = row["dst"],
+            dst_ip  = row["dst_addr"],
+            probe_seq = row["probe_seq"],
+            rtt_ms  = int(round(rtt_ms)),
+            ok      = True,
+        )
 
-        self.csv_w.writerow([
-            iso_utc(row["send_wall"]),
-            self.src_name, row["dst"], row["dst_addr"],
-            "tcp_synack", 4, row["probe_seq"], int(round(rtt_ms)), True,
-            self.batch_ts_iso,
-        ])
         if self.args.verbose:
             print(f"[rtt] {row['dst']:<12} sport={row['sport']} "
                   f"seq={row['probe_seq']} rtt={rtt_ms:.2f}ms")
         return 0
 
+    # ---- buffer / flush ----
+    def _enqueue_row(self, *, ts_iso, dst, dst_ip, probe_seq, rtt_ms, ok):
+        row = (ts_iso, self.src_name, dst, dst_ip,
+               "tcp_synack", 4, probe_seq, rtt_ms, ok,
+               self.batch_ts_iso)
+        need_flush = False
+        with self.buffer_lock:
+            self.buffer.append(row)
+            if len(self.buffer) >= self.args.batch_size:
+                need_flush = True
+        if need_flush:
+            self._flush("batch-size")
+
+    def _flush(self, reason: str):
+        with self.buffer_lock:
+            if not self.buffer:
+                self.last_flush = time.monotonic()
+                return
+            rows = self.buffer
+            self.buffer = []
+            self.last_flush = time.monotonic()
+        t0 = time.monotonic()
+        try:
+            self.sink.flush(rows)
+        except Exception as e:
+            print(f"[flush err] {e}", file=sys.stderr)
+        dt_ms = (time.monotonic() - t0) * 1000
+        print(f"[flush] reason={reason} rows={len(rows)} took={dt_ms:.1f}ms "
+              f"sink_total={self.sink.total}")
+
     # ---- sender ----
     def _send_one(self, dst_name: str, dst_ip: str):
-        probe_seq = self.n_sent          # monotonically increasing per daemon run
+        probe_seq = self.n_sent
         self.n_sent += 1
 
         sport = SPORT_LO + (probe_seq % SPORT_SPAN)
@@ -293,8 +402,11 @@ class ProbeDaemon:
         send_wall = time.time()
         send_mono = time.monotonic_ns()
 
+        key = (dst_ip, self.args.dport, sport, ack_expected)
         with self.pending_lock:
-            self.pending[ack_expected] = {
+            # if same key still present (e.g. sport reused before old TTL),
+            # overwrite — the old one already had its outcome recorded.
+            self.pending[key] = {
                 "send_mono_ns": send_mono,
                 "send_wall":    send_wall,
                 "sport":        sport,
@@ -302,6 +414,8 @@ class ProbeDaemon:
                 "dst_addr":     dst_ip,
                 "probe_seq":    probe_seq,
                 "deadline_ns":  send_mono + self.args.timeout_ms * 1_000_000,
+                "matched":      False,
+                "match_mono":   0,
             }
 
         scapy_send(pkt, iface=self.args.iface, verbose=0)
@@ -324,56 +438,64 @@ class ProbeDaemon:
             except Exception as e:
                 print(f"[send err] {dst_name} {dst_ip}: {e}")
             i += 1
-            # sleep in small ticks so ctrl-c is responsive
             slept = 0.0
             while slept < interval and not self.stop_flag:
                 dt_s = min(0.1, interval - slept)
                 time.sleep(dt_s)
                 slept += dt_s
 
-    def _sweep_timeouts(self):
-        """Drain expired pending entries -> CSV as ok=false rows."""
-        now = time.monotonic_ns()
-        expired = []
+    def _sweep_pending(self):
+        """(a) mark unmatched entries past deadline as timeout, enqueue loss row
+           (b) evict matched entries older than MATCHED_TTL_S."""
+        now_ns  = time.monotonic_ns()
+        ttl_ns  = int(MATCHED_TTL_S * 1e9)
+        expired_timeouts = []
         with self.pending_lock:
-            for k, v in list(self.pending.items()):
-                if now >= v["deadline_ns"]:
-                    expired.append(v)
-                    del self.pending[k]
-        for row in expired:
+            for k in list(self.pending.keys()):
+                v = self.pending[k]
+                if v["matched"]:
+                    if now_ns - v["match_mono"] >= ttl_ns:
+                        del self.pending[k]
+                else:
+                    if now_ns >= v["deadline_ns"]:
+                        expired_timeouts.append(v)
+                        del self.pending[k]
+        for v in expired_timeouts:
             self.n_timeout += 1
-            self.csv_w.writerow([
-                iso_utc(row["send_wall"]),
-                self.src_name, row["dst"], row["dst_addr"],
-                "tcp_synack", 4, row["probe_seq"], None, False,
-                self.batch_ts_iso,
-            ])
+            self._enqueue_row(
+                ts_iso    = iso_utc(v["send_wall"]),
+                dst       = v["dst"],
+                dst_ip    = v["dst_addr"],
+                probe_seq = v["probe_seq"],
+                rtt_ms    = None,
+                ok        = False,
+            )
             if self.args.verbose:
-                print(f"[to]  {row['dst']:<12} sport={row['sport']} "
-                      f"seq={row['probe_seq']} TIMEOUT")
+                print(f"[to]  {v['dst']:<12} sport={v['sport']} "
+                      f"seq={v['probe_seq']} TIMEOUT")
 
     # ---- main poll loop ----
     def run(self):
         self.bpf_setup()
 
-        # sender in a thread; poll in main
         t = threading.Thread(target=self._sender_loop, name="sender",
                              daemon=True)
         t.start()
 
-        # signals
         def _sig(_signum, _frame):
             self.stop_flag = True
         signal.signal(signal.SIGINT,  _sig)
         signal.signal(signal.SIGTERM, _sig)
 
         print(f"[info] daemon started. src={self.src_name}({self.src_ip}) "
-              f"targets={[t[0] for t in self.args.target]} "
+              f"targets={[x[0] for x in self.args.target]} "
               f"interval={self.args.interval_ms}ms "
-              f"timeout={self.args.timeout_ms}ms")
-        print(f"[info] csv -> {self.args.csv}")
+              f"timeout={self.args.timeout_ms}ms "
+              f"sink={self.args.sink} "
+              f"batch_size={self.args.batch_size} "
+              f"batch_interval={self.args.batch_interval_s}s")
 
-        last_stat = time.monotonic()
+        last_stat  = time.monotonic()
         last_sweep = time.monotonic()
         try:
             while not self.stop_flag:
@@ -386,34 +508,48 @@ class ProbeDaemon:
                     break
                 now = time.monotonic()
                 if now - last_sweep >= 0.5:
-                    self._sweep_timeouts()
+                    self._sweep_pending()
                     last_sweep = now
+                if now - self.last_flush >= self.args.batch_interval_s:
+                    self._flush("batch-interval")
                 if now - last_stat >= 5.0:
+                    with self.buffer_lock:
+                        buf_n = len(self.buffer)
+                    with self.pending_lock:
+                        pend_n = len(self.pending)
                     print(f"[stat] sent={self.n_sent} matched={self.n_matched} "
                           f"timeout={self.n_timeout} "
-                          f"unknown_sa={self.n_unknown_sa} "
-                          f"pending={len(self.pending)}")
+                          f"sa_retrans={self.n_sa_retrans} "
+                          f"sa_orphan={self.n_sa_orphan} "
+                          f"pending={pend_n} buffer={buf_n} "
+                          f"flushed={self.sink.total}")
                     last_stat = now
         finally:
-            # give sender a moment to finish + drain remaining pending as timeouts
             self.stop_flag = True
             t.join(timeout=2.0)
-            # final sweep — count anything still pending as loss
+            # final sweep — count remaining unmatched as timeout
             with self.pending_lock:
-                remaining = list(self.pending.values())
+                remaining = [v for v in self.pending.values()
+                             if not v["matched"]]
                 self.pending.clear()
-            for row in remaining:
+            for v in remaining:
                 self.n_timeout += 1
-                self.csv_w.writerow([
-                    iso_utc(row["send_wall"]),
-                    self.src_name, row["dst"], row["dst_addr"],
-                    "tcp_synack", 4, row["probe_seq"], None, False,
-                    self.batch_ts_iso,
-                ])
-            self.csv_fh.flush(); self.csv_fh.close()
+                self._enqueue_row(
+                    ts_iso    = iso_utc(v["send_wall"]),
+                    dst       = v["dst"],
+                    dst_ip    = v["dst_addr"],
+                    probe_seq = v["probe_seq"],
+                    rtt_ms    = None,
+                    ok        = False,
+                )
+            self._flush("shutdown")
+            self.sink.close()
             self.bpf_teardown()
             print(f"[done] sent={self.n_sent} matched={self.n_matched} "
-                  f"timeout={self.n_timeout} unknown_sa={self.n_unknown_sa}")
+                  f"timeout={self.n_timeout} "
+                  f"sa_retrans={self.n_sa_retrans} "
+                  f"sa_orphan={self.n_sa_orphan} "
+                  f"flushed_total={self.sink.total}")
 
 
 def main():
@@ -429,14 +565,23 @@ def main():
                     help="one or more name=ipv4 targets, e.g. hongkong=1.2.3.4")
     ap.add_argument("--dport", type=int, default=22)
     ap.add_argument("--src-name", default=None,
-                    help="src label written to CSV (default: hostname)")
+                    help="src label written to DB (default: hostname)")
     ap.add_argument("--interval-ms", type=int, default=1000,
                     help="delay between successive SYNs across all targets")
     ap.add_argument("--timeout-ms", type=int, default=3000,
                     help="mark probe as loss if no SA within this window")
     ap.add_argument("--duration-s", type=int, default=0,
                     help="stop after N seconds (0 = run until ctrl-c)")
-    ap.add_argument("--csv", default="/var/log/vps_probe/rtt.csv")
+
+    ap.add_argument("--sink", choices=["pg", "stdout"], default="pg")
+    ap.add_argument("--pg-dsn",
+                    default=os.environ.get("PROBE_PG_DSN", ""),
+                    help="Postgres DSN; also read from $PROBE_PG_DSN")
+    ap.add_argument("--batch-size", type=int, default=1000,
+                    help="flush when buffer reaches this many rows")
+    ap.add_argument("--batch-interval-s", type=int, default=300,
+                    help="flush at least every N seconds even if buffer small")
+
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
