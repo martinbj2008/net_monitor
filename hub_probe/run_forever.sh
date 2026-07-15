@@ -33,7 +33,7 @@ IFACE="eth0"
 INTERVAL_MS=1000
 TIMEOUT_MS=3000
 BATCH_SIZE=1000
-BATCH_INTERVAL_S=300
+BATCH_INTERVAL_S=60
 
 # Business label for this HUB, written to probe_sample.src.
 # Do NOT rely on hostname (the box is named VM-0-15-ubuntu which is meaningless).

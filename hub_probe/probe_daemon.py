@@ -1007,7 +1007,7 @@ def main():
                     help="Postgres DSN; also read from $PROBE_PG_DSN")
     ap.add_argument("--batch-size", type=int, default=1000,
                     help="flush when buffer reaches this many rows")
-    ap.add_argument("--batch-interval-s", type=int, default=300,
+    ap.add_argument("--batch-interval-s", type=int, default=60,
                     help="flush at least every N seconds even if buffer small")
 
     ap.add_argument("--verbose", action="store_true")
