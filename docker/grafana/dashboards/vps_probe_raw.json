@@ -4,7 +4,7 @@
   "tags": ["vps_probe", "smokeping", "raw"],
   "timezone": "${tz}",
   "schemaVersion": 39,
-  "version": 2,
+  "version": 3,
   "editable": true,
   "graphTooltip": 1,
   "refresh": "30s",
@@ -156,6 +156,74 @@
       "options": {
         "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Summary by proto × ip_ver - $src → $dst  (time range)",
+      "datasource": { "type": "postgres", "uid": "probe-pg" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "description": "Aggregate stats over the dashboard time range, grouped by (proto, ip_ver). Ignores the $proto and $ipver variables so you can compare all 4 combinations side by side.",
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT\n    proto                                                                                  AS \"proto\",\n    ip_ver                                                                                 AS \"ip_ver\",\n    COUNT(*)                                                                               AS \"samples\",\n    SUM(CASE WHEN NOT ok THEN 1 ELSE 0 END)                                                AS \"fails\",\n    ROUND(100.0 * SUM(CASE WHEN NOT ok THEN 1 ELSE 0 END) / NULLIF(COUNT(*),0), 2)         AS \"loss_pct\",\n    ROUND(AVG(rtt_ms) FILTER (WHERE ok)::numeric, 2)                                       AS \"avg_ms\",\n    ROUND(MIN(rtt_ms) FILTER (WHERE ok)::numeric, 2)                                       AS \"min_ms\",\n    ROUND(MAX(rtt_ms) FILTER (WHERE ok)::numeric, 2)                                       AS \"max_ms\",\n    ROUND(STDDEV(rtt_ms) FILTER (WHERE ok)::numeric, 2)                                    AS \"std_ms\",\n    ROUND((PERCENTILE_CONT(0.5)  WITHIN GROUP (ORDER BY rtt_ms) FILTER (WHERE ok))::numeric, 2) AS \"p50_ms\",\n    ROUND((PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY rtt_ms) FILTER (WHERE ok))::numeric, 2) AS \"p95_ms\"\nFROM probe_sample\nWHERE $__timeFilter(ts)\n  AND src = '$src' AND dst = '$dst'\nGROUP BY proto, ip_ver\nORDER BY proto, ip_ver"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "loss_pct" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green",       "value": null },
+                    { "color": "yellow",      "value": 1 },
+                    { "color": "orange",      "value": 5 },
+                    { "color": "red",         "value": 20 },
+                    { "color": "dark-red",    "value": 50 }
+                  ]
+                }
+              }
+            ]
+          },
+          { "matcher": { "id": "byName", "options": "avg_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] },
+          { "matcher": { "id": "byName", "options": "min_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] },
+          { "matcher": { "id": "byName", "options": "max_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] },
+          { "matcher": { "id": "byName", "options": "std_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] },
+          { "matcher": { "id": "byName", "options": "p50_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] },
+          { "matcher": { "id": "byName", "options": "p95_ms" }, "properties": [ { "id": "unit", "value": "ms" } ] }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false, "reducer": ["sum"], "fields": "" },
+        "sortBy": [
+          { "displayName": "proto", "desc": false },
+          { "displayName": "ip_ver", "desc": false }
+        ]
       }
     }
   ]
