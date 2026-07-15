@@ -230,7 +230,12 @@ class ProbeDaemon:
         self.args = args
         self.stop_flag = False
 
-        self.src_name = args.src_name or socket.gethostname()
+        # --src-name is required (enforced by argparse). We deliberately do NOT
+        # fall back to socket.gethostname(): the box hostname (e.g.
+        # 'VM-0-15-ubuntu') is meaningless as a business label and silently
+        # ends up in probe_sample.src, polluting downstream dashboards.
+        # Deployment MUST decide the name (see run_forever.sh SRC_NAME).
+        self.src_name = args.src_name
         # pick src IP once from the first target — hub only has one uplink
         first_ip = args.target[0][1]
         self.src_ip = local_ip_for(first_ip)
@@ -598,8 +603,11 @@ def main():
                     help=f"fixed source port for every SYN; must equal "
                          f"PROBE_PORT ({PROBE_PORT}) so XDP catches replies. "
                          f"default {DEFAULT_SPORT}")
-    ap.add_argument("--src-name", default=None,
-                    help="src label written to DB (default: hostname)")
+    ap.add_argument("--src-name", required=True,
+                    help="business label for this probe host, written to "
+                         "probe_sample.src (e.g. 'bangkok'). REQUIRED: we "
+                         "refuse to fall back to socket.gethostname() because "
+                         "the OS hostname is not a business identity.")
     ap.add_argument("--interval-ms", type=int, default=1000,
                     help="delay between successive SYNs across all targets")
     ap.add_argument("--timeout-ms", type=int, default=3000,
