@@ -40,10 +40,14 @@ BATCH_INTERVAL_S=300
 SRC_NAME="bangkok"
 
 # Fixed peer list. Names are free-form labels stored in probe_sample.dst_name.
+# Each entry is `name=ip4[,ip6]`; if v6 present, daemon rounds-robins both
+# families and writes independent rows (proto=tcp_synack, ip_ver=4 or 6).
+# v6 addresses are the real public v6s from vps.yaml — verified reachable
+# from this hub (ping6 + scapy SYN test confirmed SA returns via eth0).
 TARGETS=(
-  "hongkong=43.132.210.4"
-  "virginia=43.165.69.64"
-  "beijing=81.70.84.208"
+  "hongkong=43.132.210.4,240d:c000:f005:fc00:8446:a124:f20a:0"
+  "virginia=43.165.69.64,240d:c000:f030:1000:8446:a124:f20a:0"
+  "beijing=81.70.84.208,2402:4e00:c054:cc00:8446:a124:f20a:0"
 )
 
 # PG DSN. Password sourced from `docker inspect probe_pg` on this HUB.
