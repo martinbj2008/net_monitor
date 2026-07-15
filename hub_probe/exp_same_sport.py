@@ -28,12 +28,14 @@
 #   --listen-s 8           how long to keep capturing after last SYN
 
 import argparse
+import ctypes as ct
 import os
 import socket
 import struct
 import sys
 import threading
 import time
+from pathlib import Path
 
 os.environ.setdefault("SCAPY_USE_PCAPDNET", "0")
 import logging
@@ -41,6 +43,59 @@ logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 from scapy.all import IP, TCP, send as scapy_send  # noqa: E402
 
 ETH_P_IP = 0x0800
+
+# ---- optional XDP attach (so kernel doesn't RST the incoming SAs) ----
+XDP_FLAGS_SKB_MODE = 1 << 1
+
+def load_libbpf():
+    for n in ("libbpf.so.1", "libbpf.so.0", "libbpf.so"):
+        try: return ct.CDLL(n, use_errno=True)
+        except OSError: pass
+    raise RuntimeError("libbpf not found")
+
+class XdpAttach:
+    def __init__(self, iface, obj_path):
+        self.iface = iface
+        self.obj_path = obj_path
+        self.lb = load_libbpf()
+        self.lb.bpf_object__open_file.restype = ct.c_void_p
+        self.lb.bpf_object__open_file.argtypes = [ct.c_char_p, ct.c_void_p]
+        self.lb.bpf_object__load.restype = ct.c_int
+        self.lb.bpf_object__load.argtypes = [ct.c_void_p]
+        self.lb.bpf_object__close.argtypes = [ct.c_void_p]
+        self.lb.bpf_object__find_program_by_name.restype = ct.c_void_p
+        self.lb.bpf_object__find_program_by_name.argtypes = [ct.c_void_p, ct.c_char_p]
+        self.lb.bpf_program__fd.restype = ct.c_int
+        self.lb.bpf_program__fd.argtypes = [ct.c_void_p]
+        self.lb.bpf_xdp_attach.restype = ct.c_int
+        self.lb.bpf_xdp_attach.argtypes = [ct.c_int, ct.c_int, ct.c_uint32, ct.c_void_p]
+        self.lb.bpf_xdp_detach.restype = ct.c_int
+        self.lb.bpf_xdp_detach.argtypes = [ct.c_int, ct.c_uint32, ct.c_void_p]
+        self.obj = None
+        self.ifindex = socket.if_nametoindex(iface)
+        self.flags = XDP_FLAGS_SKB_MODE
+
+    def __enter__(self):
+        self.obj = self.lb.bpf_object__open_file(str(self.obj_path).encode(), None)
+        if not self.obj: raise RuntimeError("bpf_object__open_file failed")
+        if self.lb.bpf_object__load(self.obj) != 0:
+            raise RuntimeError(f"bpf_object__load: {os.strerror(ct.get_errno())}")
+        prog = self.lb.bpf_object__find_program_by_name(self.obj, b"probe_xdp")
+        if not prog: raise RuntimeError("prog probe_xdp not found")
+        prog_fd = self.lb.bpf_program__fd(prog)
+        if self.lb.bpf_xdp_attach(self.ifindex, prog_fd, self.flags, None) != 0:
+            raise RuntimeError(f"bpf_xdp_attach: {os.strerror(ct.get_errno())}")
+        print(f"[xdp] attached on {self.iface} (generic mode)")
+        return self
+
+    def __exit__(self, *a):
+        try:
+            self.lb.bpf_xdp_detach(self.ifindex, self.flags, None)
+            print("[xdp] detached")
+        except Exception as e:
+            print(f"[xdp] detach err: {e}")
+        if self.obj:
+            self.lb.bpf_object__close(self.obj)
 
 def local_ip_for(dst):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -118,13 +173,25 @@ def main():
     ap.add_argument("--iface", default="eth0")
     ap.add_argument("--dst", required=True)
     ap.add_argument("--dport", type=int, default=22)
-    ap.add_argument("--sport", type=int, default=65430)
+    ap.add_argument("--sport", type=int, default=65420,
+                    help="fixed hub sport for all N SYNs. Must fall in "
+                         "the XDP filter's [65408..65423] so incoming SAs "
+                         "are dropped by XDP (kernel never sees them, so "
+                         "no RST is emitted).")
     ap.add_argument("--count", type=int, default=3)
     ap.add_argument("--delta", type=int, default=5000)
     ap.add_argument("--gap-ms", type=int, default=200)
     ap.add_argument("--listen-s", type=float, default=8.0)
     ap.add_argument("--seq-base", type=lambda x: int(x, 0),
                     default=0x20000000)
+    ap.add_argument("--attach-xdp", action="store_true",
+                    help="attach the probe_xdp dropper for the run and "
+                         "detach at the end (recommended so the kernel "
+                         "won't RST the SAs)")
+    ap.add_argument("--obj",
+                    default=str(Path(__file__).resolve().parent.parent
+                                / "bpf" / "probe_xdp.bpf.o"),
+                    help="path to probe_xdp.bpf.o (used with --attach-xdp)")
     args = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -134,62 +201,71 @@ def main():
     print(f"[info] hub={my_ip} leaf={args.dst}:{args.dport} "
           f"sport={args.sport} count={args.count} delta={args.delta} "
           f"gap={args.gap_ms}ms")
-    print("[warn] make sure the XDP dropper is attached on "
-          f"{args.iface} first, otherwise the kernel will RST the SAs")
+    if not args.attach_xdp:
+        print("[warn] --attach-xdp NOT set. Make sure the XDP dropper is "
+              f"already attached on {args.iface}, otherwise the kernel "
+              "will RST the SAs and this test is meaningless.")
 
-    stop = threading.Event()
-    sn = Sniffer(args.iface, my_ip, args.dst, args.sport, stop)
-    sn.start()
+    def run_experiment():
+        stop = threading.Event()
+        sn = Sniffer(args.iface, my_ip, args.dst, args.sport, stop)
+        sn.start()
+        # small delay so sniffer is really in recv() before we send
+        time.sleep(0.2)
 
-    sent = []
-    t0_wall = time.time()
-    for i in range(args.count):
-        seq_i = (args.seq_base + i * args.delta) & 0xffffffff
-        pkt = IP(src=my_ip, dst=args.dst) / \
-              TCP(sport=args.sport, dport=args.dport, flags="S",
-                  seq=seq_i, window=64240,
-                  options=[("MSS", 1460)])
-        t_send = time.monotonic()
-        scapy_send(pkt, iface=args.iface, verbose=0)
-        sent.append((i, seq_i, t_send))
-        print(f"[tx {i}] seq={seq_i} (=0x{seq_i:08x}) "
-              f"ack_expected_by_hub={(seq_i+1)&0xffffffff:#010x}")
-        if i < args.count - 1:
-            time.sleep(args.gap_ms / 1000.0)
+        sent = []
+        for i in range(args.count):
+            seq_i = (args.seq_base + i * args.delta) & 0xffffffff
+            pkt = IP(src=my_ip, dst=args.dst) / \
+                  TCP(sport=args.sport, dport=args.dport, flags="S",
+                      seq=seq_i, window=64240,
+                      options=[("MSS", 1460)])
+            t_send = time.monotonic()
+            scapy_send(pkt, iface=args.iface, verbose=0)
+            sent.append((i, seq_i, t_send))
+            print(f"[tx {i}] seq={seq_i} (=0x{seq_i:08x}) "
+                  f"ack_expected_by_hub={(seq_i+1)&0xffffffff:#010x}")
+            if i < args.count - 1:
+                time.sleep(args.gap_ms / 1000.0)
 
-    print(f"[info] all {args.count} SYNs sent, listening {args.listen_s}s ...")
-    time.sleep(args.listen_s)
-    stop.set(); sn.join(timeout=2.0)
+        print(f"[info] all {args.count} SYNs sent, listening "
+              f"{args.listen_s}s ...")
+        time.sleep(args.listen_s)
+        stop.set(); sn.join(timeout=2.0)
 
-    print()
-    print(f"=========== captured {len(sn.hits)} inbound packets from "
-          f"{args.dst}:22 -> hub:{args.sport} ===========")
-    if not sn.hits:
-        print("(none — kernel may have RST'd, or leaf sshd dropped, or "
-              "packets were filtered upstream)")
-        return
+        print()
+        print(f"=========== captured {len(sn.hits)} inbound packets from "
+              f"{args.dst}:22 -> hub:{args.sport} ===========")
+        if not sn.hits:
+            print("(none — kernel may have RST'd, or leaf sshd dropped, or "
+                  "packets were filtered upstream)")
+            return
 
-    # de-dup print by (seq, ack, flags) but preserve order
-    for h in sn.hits:
-        rel = h["_t"] - sent[0][2]
-        # which of our SYNs does this ack answer?
-        which = "?"
-        for i, s, _ in sent:
-            if h["ack"] == (s + 1) & 0xffffffff:
-                which = f"SYN#{i}(seq={s:#010x})"; break
-        print(f"  t+{rel*1000:7.1f}ms flags={flag_str(h['flags']):<5} "
-              f"seq(leaf_isn)={h['seq']:#010x} "
-              f"ack(hub_isn+1)={h['ack']:#010x} -> acks {which}")
+        for h in sn.hits:
+            rel = h["_t"] - sent[0][2]
+            which = "?"
+            for i, s, _ in sent:
+                if h["ack"] == (s + 1) & 0xffffffff:
+                    which = f"SYN#{i}(seq={s:#010x})"; break
+            print(f"  t+{rel*1000:7.1f}ms flags={flag_str(h['flags']):<5} "
+                  f"seq(leaf_isn)={h['seq']:#010x} "
+                  f"ack(hub_isn+1)={h['ack']:#010x} -> acks {which}")
 
-    # summary
-    sas = [h for h in sn.hits if (h["flags"] & 0x12) == 0x12]
-    unique_ack = sorted({h["ack"] for h in sas})
-    unique_seq = sorted({h["seq"] for h in sas})
-    print()
-    print(f"[sum] total_SA={len(sas)} "
-          f"unique_ack={len(unique_ack)} unique_leaf_isn={len(unique_seq)}")
-    print(f"[sum] unique_ack list: {[hex(a) for a in unique_ack]}")
-    print(f"[sum] unique_leaf_isn list: {[hex(s) for s in unique_seq]}")
+        sas = [h for h in sn.hits if (h["flags"] & 0x12) == 0x12]
+        unique_ack = sorted({h["ack"] for h in sas})
+        unique_seq = sorted({h["seq"] for h in sas})
+        print()
+        print(f"[sum] total_SA={len(sas)} "
+              f"unique_ack={len(unique_ack)} "
+              f"unique_leaf_isn={len(unique_seq)}")
+        print(f"[sum] unique_ack list: {[hex(a) for a in unique_ack]}")
+        print(f"[sum] unique_leaf_isn list: {[hex(s) for s in unique_seq]}")
+
+    if args.attach_xdp:
+        with XdpAttach(args.iface, args.obj):
+            run_experiment()
+    else:
+        run_experiment()
 
 if __name__ == "__main__":
     main()
