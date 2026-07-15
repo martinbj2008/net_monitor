@@ -39,6 +39,10 @@ FILES=(
   "hub_probe/step3_run.sh"
   "hub_probe/verify_kernel_rst.sh"
   "hub_probe/verify_rst_dropper.sh"
+  # --- XDP Step 4: unified probe daemon + CSV uploader ---
+  "hub_probe/probe_daemon.py"
+  "hub_probe/upload_csv_to_pg.py"
+  "hub_probe/step4_run.sh"
 )
 
 PUSH=1
