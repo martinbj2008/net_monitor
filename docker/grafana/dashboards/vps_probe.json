@@ -63,11 +63,13 @@
         "name": "ipver",
         "type": "custom",
         "label": "IP Version",
-        "query": "4,6",
-        "current": { "text": "4", "value": "4" },
+        "description": "Filter Panel 1 lines. 'all' shows v4 and v6 side by side; 4 or 6 hides the other family.",
+        "query": "all,4,6",
+        "current": { "text": "all", "value": "all" },
         "options": [
-          { "text": "4", "value": "4", "selected": true },
-          { "text": "6", "value": "6", "selected": false }
+          { "text": "all", "value": "all", "selected": true  },
+          { "text": "4",   "value": "4",   "selected": false },
+          { "text": "6",   "value": "6",   "selected": false }
         ]
       },
       {
@@ -89,16 +91,16 @@
     {
       "id": 1,
       "type": "timeseries",
-      "title": "Smokeping - $src → $dst  ($proto/v$ipver)",
+      "title": "Smokeping - $src → $dst  ($proto, ipver=$ipver)",
       "datasource": { "type": "postgres", "uid": "probe-pg" },
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 0 },
-      "description": "Grey band = [min, max] RTT range (jitter). Solid line = avg RTT. Red dots on right axis = loss %. Timestamps aligned to UTC in DB; displayed per dashboard timezone.",
+      "description": "Grey/orange band = [min, max] RTT range per IP family. Solid line = avg RTT (blue=v4, orange=v6). Coloured dots on right axis = loss %. NULL series (no samples for that family) are skipped. Toggle $ipver to focus on one family.",
       "targets": [
         {
           "refId": "A",
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT to_timestamp(floor(extract(epoch FROM ts) / $bucket) * $bucket) AS \"time\",\n       min(rtt_ms) FILTER (WHERE ok) AS \"rtt_min\",\n       avg(rtt_ms) FILTER (WHERE ok) AS \"rtt_avg\",\n       max(rtt_ms) FILTER (WHERE ok) AS \"rtt_max\",\n       (1 - count(*) FILTER (WHERE ok)::float / count(*)) * 100 AS \"loss_pct\"\nFROM probe_sample\nWHERE $__timeFilter(ts)\n  AND src = '$src' AND dst = '$dst'\n  AND proto = '$proto' AND ip_ver = $ipver\nGROUP BY 1\nORDER BY 1"
+          "rawSql": "SELECT bucket AS \"time\",\n       min(rtt_ms) FILTER (WHERE ok AND ip_ver=4) AS \"rtt_min_v4\",\n       avg(rtt_ms) FILTER (WHERE ok AND ip_ver=4) AS \"rtt_avg_v4\",\n       max(rtt_ms) FILTER (WHERE ok AND ip_ver=4) AS \"rtt_max_v4\",\n       min(rtt_ms) FILTER (WHERE ok AND ip_ver=6) AS \"rtt_min_v6\",\n       avg(rtt_ms) FILTER (WHERE ok AND ip_ver=6) AS \"rtt_avg_v6\",\n       max(rtt_ms) FILTER (WHERE ok AND ip_ver=6) AS \"rtt_max_v6\",\n       (1 - count(*) FILTER (WHERE ok AND ip_ver=4)::float\n            / NULLIF(count(*) FILTER (WHERE ip_ver=4), 0)) * 100 AS \"loss_pct_v4\",\n       (1 - count(*) FILTER (WHERE ok AND ip_ver=6)::float\n            / NULLIF(count(*) FILTER (WHERE ip_ver=6), 0)) * 100 AS \"loss_pct_v6\"\nFROM (\n  SELECT to_timestamp(floor(extract(epoch FROM ts) / $bucket) * $bucket) AS bucket,\n         ok, rtt_ms, ip_ver\n  FROM probe_sample\n  WHERE $__timeFilter(ts)\n    AND src = '$src' AND dst = '$dst'\n    AND proto = '$proto'\n    AND ('$ipver' = 'all' OR ip_ver::text = '$ipver')\n) t\nGROUP BY bucket\nORDER BY bucket"
         }
       ],
       "fieldConfig": {
@@ -117,35 +119,63 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "rtt_max" },
+            "matcher": { "id": "byName", "options": "rtt_max_v4" },
             "properties": [
-              { "id": "custom.fillBelowTo", "value": "rtt_min" },
+              { "id": "custom.fillBelowTo", "value": "rtt_min_v4" },
               { "id": "custom.lineWidth", "value": 0 },
-              { "id": "custom.fillOpacity", "value": 25 },
+              { "id": "custom.fillOpacity", "value": 20 },
               { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } },
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#808080" } },
-              { "id": "displayName", "value": "rtt_max" }
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#a3c9f0" } },
+              { "id": "displayName", "value": "rtt_max_v4" }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "rtt_min" },
+            "matcher": { "id": "byName", "options": "rtt_min_v4" },
             "properties": [
               { "id": "custom.lineWidth", "value": 0 },
               { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } },
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#808080" } },
-              { "id": "displayName", "value": "rtt_min" }
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#a3c9f0" } },
+              { "id": "displayName", "value": "rtt_min_v4" }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "rtt_avg" },
+            "matcher": { "id": "byName", "options": "rtt_avg_v4" },
             "properties": [
               { "id": "custom.lineWidth", "value": 2 },
               { "id": "color", "value": { "mode": "fixed", "fixedColor": "#3274d9" } },
-              { "id": "displayName", "value": "rtt_avg" }
+              { "id": "displayName", "value": "v4 avg" }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "loss_pct" },
+            "matcher": { "id": "byName", "options": "rtt_max_v6" },
+            "properties": [
+              { "id": "custom.fillBelowTo", "value": "rtt_min_v6" },
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.fillOpacity", "value": 20 },
+              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f5c78a" } },
+              { "id": "displayName", "value": "rtt_max_v6" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "rtt_min_v6" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 0 },
+              { "id": "custom.hideFrom", "value": { "legend": true, "tooltip": false, "viz": false } },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#f5c78a" } },
+              { "id": "displayName", "value": "rtt_min_v6" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "rtt_avg_v6" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 2 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#ff9830" } },
+              { "id": "displayName", "value": "v6 avg" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "loss_pct_v4" },
             "properties": [
               { "id": "unit", "value": "percent" },
               { "id": "custom.axisPlacement", "value": "right" },
@@ -156,7 +186,22 @@
               { "id": "color", "value": { "mode": "fixed", "fixedColor": "#e02f44" } },
               { "id": "max", "value": 100 },
               { "id": "min", "value": 0 },
-              { "id": "displayName", "value": "loss %" }
+              { "id": "displayName", "value": "v4 loss %" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "loss_pct_v6" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.axisLabel", "value": "loss %" },
+              { "id": "custom.drawStyle", "value": "points" },
+              { "id": "custom.pointSize", "value": 8 },
+              { "id": "custom.showPoints", "value": "always" },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#c00020" } },
+              { "id": "max", "value": 100 },
+              { "id": "min", "value": 0 },
+              { "id": "displayName", "value": "v6 loss %" }
             ]
           }
         ]
