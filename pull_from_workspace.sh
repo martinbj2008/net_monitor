@@ -42,6 +42,8 @@ FILES=(
   # --- XDP Step 4: unified probe daemon (direct PG sink) ---
   "hub_probe/probe_daemon.py"
   "hub_probe/step4_run.sh"
+  # --- experiments ---
+  "hub_probe/exp_same_sport.py"
 )
 
 PUSH=1
