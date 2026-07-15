@@ -30,7 +30,7 @@ set -euo pipefail
 
 # ---------- config: EDIT HERE if peer list / creds change ----------
 IFACE="eth0"
-INTERVAL_MS=1000
+INTERVAL_MS=100
 TIMEOUT_MS=3000
 BATCH_SIZE=1000
 BATCH_INTERVAL_S=60
