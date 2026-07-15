@@ -1,7 +1,7 @@
 /* probe_xdp.h — shared event layout for BPF <-> userspace ringbuf.
  *
  * IMPORTANT: any change here must be mirrored in Python's struct.unpack
- * format string in hub_probe/test_loader.py (currently "<QIIHHIIB3x", 24B).
+ * format string in hub_probe/test_loader.py (currently "<QIIHHIIB3x", 32B).
  *
  * All multi-byte integer fields are in NETWORK byte order for the network
  * identifiers (saddr/daddr/sport/dport/seq/ack_seq), because BPF reads them
@@ -22,7 +22,7 @@ struct probe_event {
     __u32 seq;        /* TCP seq     (network byte order)                  */
     __u32 ack_seq;    /* TCP ack_seq (network byte order)                  */
     __u8  tcp_flags;  /* raw TCP flag byte (URG|ACK|PSH|RST|SYN|FIN bits)  */
-    __u8  _pad[3];    /* explicit padding — struct is exactly 24 bytes     */
+    __u8  _pad[3];    /* explicit padding — struct is exactly 32 bytes     */
 };
 
 #endif /* PROBE_XDP_H */

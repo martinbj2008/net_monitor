@@ -35,7 +35,7 @@ from pathlib import Path
 #                       __u8  tcp_flags; __u8 _pad[3]; };
 EVENT_FMT  = "<QIIHHIIB3x"          # little-endian host struct layout
 EVENT_SIZE = struct.calcsize(EVENT_FMT)
-assert EVENT_SIZE == 24, f"probe_event size mismatch: {EVENT_SIZE}"
+assert EVENT_SIZE == 32, f"probe_event size mismatch: {EVENT_SIZE}"
 
 FLAG_NAMES = [(0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"),
               (0x08, "PSH"), (0x10, "ACK"), (0x20, "URG")]
