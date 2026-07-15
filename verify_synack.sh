@@ -73,8 +73,11 @@ if [[ -n "$TARGETS_ARG" ]]; then
     TARGETS+=("$t")
   done
 else
+  # Default targets: stable network points only.
+  # NOTE: beijing (81.70.84.208) excluded — the hub->beijing path is currently
+  # flaky (~350ms RTT with ~20% packet loss on plain ICMP), which pollutes
+  # SYN/SYN-ACK stats. Add it back manually via --targets once network is fixed.
   TARGETS=(
-    "beijing:81.70.84.208"
     "hongkong:43.132.210.4"
     "virginia:43.165.69.64"
   )
