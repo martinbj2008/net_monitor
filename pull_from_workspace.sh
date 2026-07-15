@@ -36,6 +36,7 @@ FILES=(
   "hub_probe/test_loader.py"
   # --- XDP Step 3 verification probe ---
   "hub_probe/step3_probe.py"
+  "hub_probe/step3_run.sh"
 )
 
 PUSH=1
