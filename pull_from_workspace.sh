@@ -25,6 +25,7 @@ SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # --- whitelist: files (relative to SRC_DIR) to mirror into this repo ---
 FILES=(
   "verify_synack.sh"
+  "verify_synack_scapy.py"
   "hub_sysctl_reserve_ports.sh"
   "xdp_env_check.sh"
   "tcp_probe_diag.sh"
