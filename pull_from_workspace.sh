@@ -42,6 +42,7 @@ FILES=(
   # --- XDP Step 4: unified probe daemon (direct PG sink) ---
   "hub_probe/probe_daemon.py"
   "hub_probe/step4_run.sh"
+  "hub_probe/run_forever.sh"
   # --- experiments ---
   "hub_probe/exp_same_sport.py"
   # --- ops / one-off cleanup scripts (run on hub + all leaves) ---
